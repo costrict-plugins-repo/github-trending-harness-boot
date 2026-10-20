@@ -1,0 +1,2814 @@
+version: 2.3.9
+project:
+  name: harness-boot
+  mode: prototype
+  summary: Claude Code harness plugin — drives a project from Walking Skeleton
+    through ongoing evolution with spec.yaml as the single source of truth.
+  description: |
+    A "harness" tool that runs as a plugin inside Anthropic Claude Code.
+    Given a single spec.yaml, it (1) generates a buildable Walking
+    Skeleton and drives it through the runtime smoke gate (Gate 5), then
+    (2) automates the ongoing cycle of adding features, refactoring, and
+    re-rolling the spec. The key idea is to separate "author's prose
+    (the human design narrative)" from "engineer's contract (the YAML
+    plus code)" at the schema level so the LLM is forced to *transform*
+    rather than copy.
+  vision: |
+    Instead of asking the user to edit spec.yaml by hand every time, the
+    four commands /harness:init → /harness:spec → /harness:sync →
+    /harness:work carry an idea all the way to deployable code in a
+    single forward flow. When the plugin upgrades, a user project only
+    needs to refresh the CLAUDE.md shim, and every decision must remain
+    auditable via the persistent log (events.log) and the state file
+    (state.yaml). The end goal: the combination of Claude Code and
+    harness-boot lifts a single developer to team-level productivity.
+  stakeholders:
+    - role: project_initiator
+      concerns:
+        - Design intent is reproducible from a single command (verified by
+          /harness:check).
+        - Decision history persists in events.log so the 'why' stays recoverable
+          later.
+        - Plugin upgrades never break an existing project (the CLAUDE.md shim
+          model).
+    - role: ai_implementer
+      concerns:
+        - Every command boot emits the 3-line preamble (the transparency
+          contract).
+        - The per-agent tool permission matrix is honored — no edits outside
+          scope.
+        - Gates 0-5 pass in order; a runtime smoke failure halts work.
+    - role: future_user
+      concerns:
+        - "Surface stays small: 4 core commands (init / spec / sync / work) + 4
+          diagnostic (status / check / events / metrics)."
+        - Editing spec.yaml is supported by IDE schema completion and validation
+          (v2.3.7).
+        - $include splits long narrative into separate md files so YAML stays
+          manageable.
+    - role: plugin_developer
+      concerns:
+        - The commands/ ↔ docs/ relationship is fixed by §11.2 and does not
+          drift.
+        - The scope of template changes that propagate into user projects is
+          clear (§11.3).
+        - Appendix D canonical-hashing implementation passes language-specific
+          test vectors.
+    - role: downstream_tooling
+      concerns:
+        - state.yaml's schema follows semver so external parsers don't break.
+        - events.log is append-only JSONL — pipes straight into streaming
+          pipelines.
+        - architecture.yaml's layer/component model is compatible with
+          architecture-linter tools.
+domain:
+  overview: |
+    The core entity is the Harness (one harness-boot instance per
+    project), and underneath it sit Spec (the product spec, the SSoT),
+    Domain and Architecture (derived views of Spec), HarnessConfig (the
+    runtime contract), State (feature / mode state), Event (persistent
+    log), Feature (the unit of development), Hook (validation scripts),
+    Protocol (inter-agent contracts), Agent (a Claude sub-agent), Skill
+    (a procedure bundle), Command (the /harness:xxx surface), Include
+    (a reference to external md), Drift (twelve kinds of mismatch),
+    Gate (the 0-5 quality gates), and Preamble (the 3-line output
+    contract). Every entity has a concrete shape on disk under
+    `.harness/` or `.claude/`, and those directories are created by
+    `/harness:init` itself. spec.yaml is the only file the user
+    edits as "author's prose"; everything else is either derived or
+    machine-maintained (the two edit-wins exceptions are domain.md and
+    architecture.yaml).
+  entities:
+    - name: Harness
+      description: 한 사용자 프로젝트에 설치된 harness-boot 인스턴스. `.harness/` + `.claude/` 2 디렉터리의 합.
+      invariants:
+        - 동일 레포에 2개 이상 존재 금지(단일 루트 가정)
+        - harness.yaml 이 존재해야 하며, harness.version 은 2.3.x semver 준수
+        - install_mode ∈ {user_scope, project_scope}; user_scope 에서는 사용자 repo 에
+          커밋되지 않음
+      sensitive: false
+    - name: Spec
+      description: spec.yaml 본체. 사용자가 사고의 글로 작성·편집하는 SSoT.
+      invariants:
+        - schema version 은 2.3.7 고정(이 문서 기준)
+        - structured 필드(🔒) 는 spec.yaml 본문에만, free-text 필드(🗒) 는 $include 경유 허용
+        - project.name · features[].id · business_rules[].id 는 하네스 내 유일
+        - prototype_mode=true 인 경우 Gate 3(coverage) 이 완화됨(`src/examples/`,
+          `src/scripts/` 제외)
+      sensitive: false
+    - name: ExpandedSpec
+      description: $include 를 전부 풀어 얻는 단일 YAML. 해시·검증·AI 입력은 이것을 사용.
+      invariants:
+        - $include 노드는 expand 후 상위 키에 완전 치환
+        - expand 는 include 깊이 1 만 허용(§13.11, MUST)
+        - expand 실패 시 Fail-Fast — 파생 파일 생성 중단
+      sensitive: false
+    - name: Domain
+      description: domain.md — spec.yaml 의 domain 블록을 렌더한 가독성 뷰. 사람이 읽기 좋다.
+      invariants:
+        - 자동 재생성 가능하나, 사용자가 직접 수정한 경우 edit-wins 로 보존(§10.4)
+        - renderer 는 spec.yaml.domain 만 원천으로 허용(추가 정보 주입 금지)
+      sensitive: false
+    - name: Architecture
+      description: architecture.yaml — 파생 아키텍처 선언(layer/component/edge 모델).
+      invariants:
+        - Spec.features[].modules 를 layer/component 로 정규화
+        - edit-wins 대상(domain.md 와 동일)
+        - architecture-linter 같은 외부 도구가 이 파일만 보고 동작
+      sensitive: false
+    - name: HarnessConfig
+      description: harness.yaml — 하네스 구성 계약. 런타임·언어·검증 정책·include_sources 트래킹.
+      invariants:
+        - tech_stack.language 가 비었으면 /harness:sync 차단
+        - include_sources[] 는 마지막 expand 시점의 include 노드를 mirror(§5.4)
+        - version 은 반드시 Spec.version 과 같은 major.minor 라인
+      sensitive: false
+    - name: State
+      description: state.yaml — 피처·모드·현재 인보케이션 상태. 기계 유지.
+      invariants:
+        - features[].status ∈ {planned, in_progress, blocked, done, archived}
+        - active_feature_id 는 항상 features[] 중 하나를 가리키거나 null
+        - gates[name].last_result ∈ {pass, fail, skipped}
+      sensitive: false
+    - name: Event
+      description: events.log 의 한 레코드. append-only JSONL.
+      invariants:
+        - ts 는 RFC3339 UTC, actor ∈ {user, command, agent, hook}
+        - kind 는 소문자 snake_case, payload 는 JSON object
+        - 기존 레코드 수정·삭제 금지(감사성), 회전은 events.log.YYYYMM 로 분할
+      sensitive: true
+      sensitive_reason: 프로젝트 파일 경로·사용자 코멘트가 섞여 저장 대상 고려 필요
+    - name: Feature
+      description: Spec.features[] 의 한 항목. 개발 단위이자 Gate 묶음 대상.
+      invariants:
+        - id 는 F-XXX 형식, type ∈ {skeleton, feature, refactor, research}
+        - type='skeleton' 은 features[0] 에만 허용(Walking Skeleton 유일성)
+        - test_strategy ∈ {tdd, contract, property, smoke} 중 하나 이상
+      sensitive: false
+    - name: Command
+      description: /harness:xxx 명령. commands/ 디렉터리의 md + claude code slash command 엔트리.
+      invariants:
+        - 핵심 4개(init/spec/sync/work) + 진단 4개(status/check/events/metrics) 가 고정 표면
+        - 모든 명령은 실행 직후 3줄 preamble 을 stdout 에 출력(§7.6)
+        - destructive 명령은 --yes 플래그 없이 실행 금지(init 예외)
+      sensitive: false
+    - name: Mode
+      description: /harness:spec 실행 모드. A(addition)·B(baseline)·R(refine)·E(explain) 4종.
+      invariants:
+        - spec.yaml 부재 시 자동 B
+        - 부재 아닌 상태에서 /harness:spec 은 입력 성격에 따라 A/R/E 자동 분기
+        - E 는 읽기 전용이며 파일 수정 금지
+      sensitive: false
+    - name: Agent
+      description: "`.claude/agents/` 의 한 에이전트 정의(md + frontmatter). sub-agent 의
+        scope/tool 을 선언."
+      invariants:
+        - 모든 에이전트는 Tool 권한 매트릭스(§6.3.1) 에 키로 존재
+        - 에이전트 정의 frontmatter 의 tools 는 매트릭스 상한 이하
+        - Context/Process/Forbidden 3 블록이 md 본문 필수
+      sensitive: false
+    - name: Skill
+      description: "`.claude/skills/` 의 절차 번들. SKILL.md + 보조 파일."
+      invariants:
+        - SKILL.md frontmatter 의 description 이 trigger 정확도 메트릭 근거
+        - skill 내부 script/ 는 실행 권한 명시(Tool 권한 매트릭스 우회 금지)
+      sensitive: false
+    - name: Hook
+      description: "`.harness/hooks/` 의 bash 스크립트. pre-commit·post-sync 등 훅 진입점."
+      invariants:
+        - exit code 0 = 성공; 0 이 아니면 hook-fail 이벤트 적재
+        - "fail-open 원칙: 훅 자체 버그가 사용자 작업을 차단하지 않음"
+        - 훅 내부에서 spec.yaml 수정 금지(SSoT 침범 방지)
+      sensitive: false
+    - name: Protocol
+      description: "`.harness/protocols/` 의 에이전트 간 규약 md. 페이로드 스키마·버전."
+      invariants:
+        - protocol_id 는 파일명과 동일, version 은 semver
+        - protocol breaking change 는 parallel-protocol 으로만 허용(drift 방지)
+      sensitive: false
+    - name: Include
+      description: spec.yaml 의 $include 노드. 외부 md 를 해당 위치에 삽입.
+      invariants:
+        - $include 는 🗒 free-text 필드에만 허용(MUST)
+        - depth=1 제한(중첩 include 금지)
+        - 대상 파일은 .harness/chapters/ 하위 md 만
+      sensitive: false
+    - name: Drift
+      description: SSoT 와 파생/구현 간 불일치. 8종 분류.
+      invariants:
+        - kind ∈ {Spec, Code, Doc, Derived, Generated, Evidence, Anchor, Include}
+        - /harness:check 는 8종 전부 탐지 & 리포트
+        - Spec-drift 해결은 항상 사용자 개입 필요(자동 수정 금지)
+      sensitive: false
+    - name: Gate
+      description: 0~5 단계 품질 관문. 0=tests · 1=compile · 2=style · 3=coverage · 4=commit
+        · 5=runtime smoke.
+      invariants:
+        - 순서대로 통과해야 함(skip 없음)
+        - Gate 5 실패 시 feature status=blocked, events.log 적재
+        - prototype_mode=true 에서만 Gate 3 완화(examples/scripts 제외)
+      sensitive: false
+    - name: Preamble
+      description: 명령 부팅 시 stdout 3줄 출력 계약(§7.6).
+      invariants:
+        - 정확히 3줄, 각 행 80자 이내
+        - 1행=mode, 2행=scope, 3행=next — 고정 필드명
+        - anti-rationalization 2행(v2.3.1) 은 preamble 직후 별도 출력
+      sensitive: false
+    - name: HashTree
+      description: 부록 D 해시 조합 결과. 전체/스코프/include 3층.
+      invariants:
+        - Canonical YAML → Canonical JSON → SHA-256 순서 고정
+        - include expanded vs. raw 두 해시를 함께 기록
+        - 테스트 벡터(§D.7) 는 구현 적합성 필수 통과
+      sensitive: false
+  business_rules:
+    - id: BR-001
+      statement: Author's prose and engineer's contract are separated at the schema
+        level (🔒 vs 🗒).
+      rationale: Forces the LLM to deliberately *transform* natural language rather
+        than copy it into a YAML structure.
+    - id: BR-002
+      statement: spec.yaml is the single product-spec SSoT; every other file is
+        derived, executed, or logged.
+      rationale: Drift detection is built on a single-source assumption — duplication
+        breaks it.
+    - id: BR-003
+      statement: features[0] must be type='skeleton', and the Walking Skeleton has to
+        pass through gate_5 (runtime smoke).
+      rationale: Prevents planning paperware — something has to boot first, then we
+        extend on top of it.
+    - id: BR-004
+      statement: Every /harness:xxx command emits a 3-line preamble to stdout
+        immediately on invocation.
+      rationale: Transparency — the user reads context and next step at a glance.
+        Introduced in v2.3.1.
+    - id: BR-005
+      statement: domain.md and architecture.yaml are derived but preserved by
+        edit-wins when the user has edited them.
+      rationale: Stops the renderer from overwriting the user's added insight; SSoT
+        divergence is reported as drift instead.
+    - id: BR-006
+      statement: Hooks are fail-open — a bug in a hook never blocks the user's work.
+      rationale: Hook failures must not hold the development flow hostage; the failure
+        itself is recorded into events.log as a hook-fail.
+    - id: BR-007
+      statement: Canonical hashing follows Canonical YAML → Canonical JSON → SHA-256,
+        and both the include-expanded and raw hashes are recorded.
+      rationale: Cross-language reproducibility (§D.7) plus separate tracking of
+        include expansion (§D.4).
+    - id: BR-008
+      statement: $include is allowed only in 🗒 free-text fields, and only to depth 1.
+      rationale: Nested includes break hash reproducibility, token predictability, and
+        IDE jump usability (§13.11).
+    - id: BR-009
+      statement: v1 compatibility is delivered only through the CLAUDE.md shim model —
+        existing .harness/ content is never overwritten.
+      rationale: Preserves user-owned files; upgrades stay tied to an explicit user
+        action (§12).
+    - id: BR-010
+      statement: "Features touching `sensitive: true` entities are forced into the TDD
+        strategy at gate_0."
+      rationale: Catches regressions on sensitive-data paths at the contract level.
+    - id: BR-011
+      statement: An agent cannot declare tools beyond the upper bound of the tool
+        permission matrix (§6.3.1) in its frontmatter.
+      rationale: Stops out-of-scope file edits and silent network calls from sneaking in.
+    - id: BR-012
+      statement: Commands honor the CQS principle — the diagnostic family (status /
+        check / events / metrics) never mutates files.
+      rationale: Unintended mutation during diagnosis would render the report
+        meaningless (§7.3.8, refined in v2.3.3).
+    - id: BR-013
+      statement: events.log is append-only JSONL; existing records cannot be modified
+        or deleted.
+      rationale: Auditability — losing the 'why this happened' trail later collapses
+        the harness's core value.
+    - id: BR-014
+      statement: The two anti-rationalization lines are always emitted right after the
+        preamble (introduced in v2.3.1).
+      rationale: Forces step compliance so the LLM can't plausibly rationalize its own
+        skips.
+    - id: BR-015
+      statement: Autonomous loops (drive and any future autonomy mechanism) escalate
+        rather than bypass Iron Law (BR-004) and anti-rationalization (BR-014).
+        They cannot self-issue --hotfix-reason; cannot call git commit/push/tag,
+        gh release, or marketplace operations; must escalate on severity=error
+        drift; must escalate after the configured retry threshold; must record
+        every halt reason to _workspace/drive/run.yaml; and obey the BR-014
+        preamble themselves. A single active goal and a single active feature
+        are allowed at any time — sequential only.
+      rationale: Iron Law's value comes from its non-negotiability. An autonomous loop
+        that quietly bypasses it inverts the harness from a guard into an attack
+        surface. Discipline is preserved by making the loop yield, not by
+        relaxing the law.
+  vocabulary:
+    - term: Walking Skeleton
+      meaning: The first feature (F-001) must be a minimal end-to-end implementation
+        that crosses the entire stack and passes through gate_5.
+    - term: Transparency-by-Preamble
+      meaning: Every command emits a 3-line summary (mode / scope / next). The
+        transparency-first principle from v2.3.1.
+    - term: Edit-wins
+      meaning: Even derived files are preserved when the user has edited them (limited
+        to domain.md and architecture.yaml).
+    - term: Fail-open hook
+      meaning: A hook failure never blocks the user's work; the failure is only logged.
+    - term: $include
+      meaning: v2.3.7 syntax for pulling an external md file into a 🗒 field of
+        spec.yaml. Fixed at depth 1.
+    - term: Canonical hashing
+      meaning: Canonical YAML → Canonical JSON → SHA-256 pipeline (Appendix D).
+    - term: Mode A/B/R/E
+      meaning: Auto-routing for /harness:spec — Addition / Baseline / Refine / Explain.
+    - term: Gate 0-5
+      meaning: "Quality gates in order: tests → compile → style → coverage → commit →
+        runtime smoke."
+    - term: CQS
+      meaning: Command-Query Separation — the principle of separating state-mutating
+        commands from read-only queries.
+    - term: SSoT
+      meaning: "Single Source of Truth. In harness-boot it is a single file: spec.yaml."
+features:
+  - id: F-001
+    name: Skeleton — /harness:init 으로 Walking Skeleton 부팅
+    type: skeleton
+    status: done
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.1 era walking-skeleton — superseded by F-025 self-dogfood +
+      F-036 brownfield seed (F-047)
+    release_target: v0.1
+    modules:
+      - init_command
+      - install_target_detector
+      - scaffold_renderer
+      - claude_md_shim
+      - preamble_emitter
+    test_strategy: tdd
+    tdd_focus:
+      - 빈 디렉터리에서 init 시 9개 파일이 정확히 생성됨
+      - 이미 .harness/ 존재 시 --yes 없이 중단
+    v0_1_smoke_notes:
+      - CC 2.1.x 에서 $CLAUDE_PLUGIN_ROOT 미설정 확정 — $PATH bin 역산으로 경로 해석 (NEW-37)
+      - .claude/ 빈 디렉터리 · CLAUDE.md 의 phantom @import 모두 silently ignore
+      - directory-type marketplace 의 installPath 가 실제로 생성되지 않음 (NEW-44)
+  - id: F-002
+    name: /harness:spec — Mode A/B/R/E 자동 분기
+    type: feature
+    status: partial
+    release_target: v0.2
+    modules:
+      - spec_command
+      - mode_classifier
+      - baseline_generator
+      - addition_merger
+      - refine_editor
+      - explain_renderer
+    test_strategy: tdd
+    tdd_focus:
+      - spec.yaml 부재 시 B, 존재 시 A/R/E 자동 선택
+      - E 는 어떤 경우에도 파일을 수정하지 않음(CQS 검사)
+  - id: F-003
+    name: /harness:sync — Phase 0(파생) + Phase 1(빌드) 2단계
+    type: feature
+    status: done
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.2 era /harness:sync — derived files generation, foundation
+      stable (F-047)
+    release_target: v0.2
+    depends_on:
+      - F-009
+      - F-010
+    modules:
+      - sync_command
+      - include_expander
+      - domain_renderer
+      - architecture_renderer
+      - gate_runner
+      - delta_selector
+      - plugin_root_resolver
+    test_strategy: tdd
+    tdd_focus:
+      - edit-wins 보존(domain.md 사용자 수정이 덮이지 않음)
+      - delta 빌드가 영향 피처만 선별
+      - include expand 실패 시 즉시 중단
+      - plugin_root_resolver 가 directory-type marketplace 에서도 source.path
+        fallback 으로 정상 동작 (NEW-44 회귀)
+  - id: F-004
+    name: /harness:work — 피처 개발 사이클
+    type: feature
+    status: done
+    release_target: v0.3
+    modules:
+      - work_command
+      - feature_selector
+      - tdd_driver
+      - gate_runner
+      - state_transitioner
+    test_strategy: tdd
+  - id: F-005
+    name: /harness:status (read-only) — v2.3.3 순수 조회
+    type: feature
+    status: done
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.3 era /harness:status — CQS read-only, foundation stable (F-047)
+    release_target: v0.3
+    modules:
+      - status_command
+      - state_reader
+      - drift_summarizer
+    test_strategy: contract
+  - id: F-006
+    name: /harness:check — 8종 드리프트 탐지
+    type: feature
+    status: partial
+    release_target: v0.3
+    modules:
+      - check_command
+      - drift_detector
+      - anchor_resolver
+      - include_integrity_checker
+    test_strategy: property
+  - id: F-007
+    name: /harness:events — 이벤트 로그 조회 (tail/filter)
+    type: feature
+    status: done
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.3 era /harness:events — JSON Lines append, foundation stable (F-047)
+    release_target: v0.3
+    modules:
+      - events_command
+      - log_tailer
+      - event_filter
+    test_strategy: contract
+  - id: F-008
+    name: /harness:metrics — 집계 지표
+    type: feature
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.3.9 era /harness:metrics — read-only metrics, foundation stable (F-047)
+    modules:
+      - metrics_command
+      - aggregator
+      - metric_formatter
+    test_strategy: contract
+  - id: F-009
+    name: $include 전개 엔진
+    type: feature
+    status: done
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.2 era include_expander — depth=1 $include enforcement,
+      foundation stable (F-047)
+    release_target: v0.2
+    modules:
+      - include_expander
+      - chapters_resolver
+      - depth_guard
+      - field_type_guard
+    test_strategy: tdd
+    tdd_focus:
+      - depth=2 include 시 즉시 실패
+      - 🔒 필드에 include 삽입 시 차단
+  - id: F-010
+    name: Canonical Hashing — Merkle 3층
+    type: feature
+    status: done
+    archived_at: 2026-04-23T00:00:00Z
+    archive_reason: v0.2 era canonical_hash — 3-layer Merkle SHA-256, foundation stable (F-047)
+    release_target: v0.2
+    modules:
+      - canonical_yaml
+      - canonical_json
+      - merkle_combiner
+      - test_vectors
+    test_strategy: property
+  - id: F-011
+    name: Preamble + Anti-rationalization 출력
+    type: feature
+    modules:
+      - preamble_emitter
+      - anti_rationalization_line
+    test_strategy: contract
+  - id: F-012
+    name: Claude sub-agents — Tool 권한 매트릭스 적용
+    type: feature
+    modules:
+      - agent_loader
+      - tool_permission_matrix
+      - agent_runner
+    test_strategy: property
+  - id: F-013
+    name: Claude skills 호출 인터페이스
+    type: feature
+    modules:
+      - skill_registry
+      - skill_invoker
+    test_strategy: contract
+  - id: F-014
+    name: Hooks 시스템 — fail-open
+    type: feature
+    modules:
+      - hook_registry
+      - hook_runner
+    test_strategy: tdd
+    tdd_focus:
+      - 훅 비정상 종료도 사용자 명령을 차단하지 않음(BR-006)
+      - 훅 내부에서 spec.yaml write 시도 시 차단
+  - id: F-015
+    name: CLAUDE.md shim + 사용자 프로젝트 분리
+    type: feature
+    modules:
+      - shim_writer
+      - shim_upgrader
+    test_strategy: contract
+  - id: F-016
+    name: $include 재귀 가드 + 깊이 1 강제
+    type: feature
+    modules:
+      - depth_guard
+      - recursion_detector
+    test_strategy: property
+  - id: F-017
+    name: Protocols — 에이전트 간 페이로드 규약
+    type: feature
+    modules:
+      - protocol_loader
+      - protocol_version_matcher
+    test_strategy: contract
+  - id: F-018
+    name: Edit-wins 정책 엔진
+    type: feature
+    modules:
+      - edit_wins_detector
+      - merge_strategy
+    test_strategy: tdd
+  - id: F-019
+    name: 사용자 프로젝트 마이그레이션 (v1 → v2)
+    type: feature
+    modules:
+      - migrate_command
+      - v1_reader
+      - v2_writer
+    test_strategy: contract
+  - id: F-020
+    name: $include 에디터/IDE 지원 (YAML Language Server)
+    type: feature
+    modules:
+      - spec_schema_json
+      - ide_yaml_ls_hint
+      - include_path_resolver
+    test_strategy: contract
+  - id: F-021
+    name: 플러그인 자체 빌드 · 배포
+    type: feature
+    modules:
+      - plugin_build
+      - release_tagger
+    test_strategy: contract
+  - id: F-022
+    name: gate_runner auto-detect layout heuristics
+    type: feature
+    modules:
+      - gate_runner
+      - detect_gate_0_command
+    test_strategy: tdd
+    tdd_focus:
+      - tests/unit/ 있고 pytest 부재 시 tests.unit module-path discover 사용
+      - tests/__init__.py 있는 기존 레이아웃은 `-s tests` 유지 (회귀 방지)
+      - tests/ 직접 test 파일 있는 평면 레이아웃 지원
+  - id: F-023
+    name: agents/ 디렉터리 인프라 (v0.4)
+    type: feature
+    modules:
+      - agents_directory
+      - agent_frontmatter_schema
+    test_strategy: contract
+    tdd_focus:
+      - agents/ 에 적어도 1 에이전트 .md 존재 · frontmatter 필수 필드 (name, description) 포함
+      - agents/README.md 에 권한 매트릭스 명시
+  - id: F-024
+    name: hooks/hooks.json 인프라 (v0.4, 최소 ship 정책)
+    type: feature
+    modules:
+      - hooks_directory
+      - hooks_json_schema
+      - hooks_fail_open_default
+    test_strategy: contract
+    tdd_focus:
+      - hooks/hooks.json 구조 유효 (JSON parse OK · 스키마 준수)
+      - 모든 훅 command 는 exit 0 또는 non-2 exit (fail-open 보장)
+      - docs/templates/hooks/ 에 opt-in 예시 3~4 종
+  - id: F-025
+    name: Phase 2 self-hosting activation (CLAUDE.md drift fix + 셀프 트래킹)
+    type: feature
+    modules:
+      - claude_md_drift_repair
+      - memory_self_hosting_active
+      - spec_canonical_f025_append
+    test_strategy: smoke
+    tdd_focus:
+      - scripts/self_check.sh 5/5 pass (spec diff · validate · sync · check ·
+        commands 규약 모두 통과)
+      - tests/unit 838+ tests 회귀 없음
+      - .harness/state.yaml 에 F-025 가 status=done 으로 전이
+      - .harness/events.log 에 F-025 의 4 lifecycle 이벤트 (activated · gate_run ·
+        evidence_declared · completed) 누적
+  - id: F-026
+    name: Phase 2 후속 정리 — smoke shim + stale doc/dead-ref + 첫 풀 사이클 reference
+    type: feature
+    modules:
+      - scripts_smoke_shim
+      - harness_readme_phase2
+      - self_check_header_phase2
+      - session_bootstrap_dead_ref
+      - changelog_unreleased_phase2
+    test_strategy: smoke
+    tdd_focus:
+      - scripts/smoke.sh 존재 + executable + bash scripts/smoke.sh 가 self_check.sh
+        와 동일 결과
+      - gate_5 가 --override-command 없이 auto-detect (work.py --run-gate gate_5 가
+        'no runtime smoke detected' 메시지 X)
+      - tests/unit 838+ tests 회귀 없음
+      - .harness/README.md · self_check.sh 에 'Phase 2' 등장 · 'Phase 1 (현재' 부재
+      - hooks/session-bootstrap.sh 에 /harness:status 부재 · /harness-boot:work 등장
+  - id: F-027
+    name: init/work issue logging — harness-boot 개선 피드백 루프
+    type: feature
+    modules:
+      - command_init_issue_log_section
+      - command_work_issue_log_section
+      - issues_log_template_schema
+    test_strategy: contract
+    tdd_focus:
+      - commands/init.md 에 'issues-log' 섹션 + 한 entry 의 schema (ts · category ·
+        severity · what · suggested_fix) 명시
+      - commands/work.md 에 동일 섹션
+      - anti-rationalization 규약 (NO skip / NO shortcut) 보존
+      - self_check.sh step 5 (commands/*.md grep) 가 새 섹션 추가 후에도 통과
+  - id: F-028
+    name: init/work prompt logging — UserPromptSubmit hook + JSONL 누적
+    type: feature
+    modules:
+      - hooks_prompt_log_sh
+      - hooks_json_user_prompt_submit
+      - prompts_jsonl_schema
+    test_strategy: contract
+    tdd_focus:
+      - hooks/prompt-log.sh 존재 + executable + .harness/ 부재 시 exit 0 + 출력 없음
+      - hooks/hooks.json 에 UserPromptSubmit 항목 + prompt-log.sh 경로 매핑
+      - .harness/ 존재 시 mock JSON stdin →
+        .harness/_workspace/prompts/YYYY-MM.jsonl 에 한 줄 JSONL append
+      - "JSONL entry schema: {ts, session_id, prompt} · UTF-8 보존 (Korean OK)"
+      - user_prompt 키 우선 · prompt 키 fallback (Claude Code 버전 호환)
+  - id: F-029
+    name: Scaling preparedness — features[] additive schema fields
+    type: feature
+    modules:
+      - schema_features_area
+      - schema_features_archived_at
+      - schema_features_archive_reason
+      - schema_features_digest
+      - schema_features_include_path
+    test_strategy: contract
+    tdd_focus:
+      - 5 신규 필드 모두 spec.schema.json properties 에 등재 + 타입 명시
+      - 기존 spec.yaml validate 통과 (필드 없는 features 도 OK)
+      - 필드 채워진 features 도 validate 통과
+      - "validate.py 가 잘못된 타입 (예: archived_at 가 비-string) 거부"
+  - id: F-030
+    name: Spec sharding tooling — shard / unshard / summary
+    type: feature
+    modules:
+      - scripts_spec_shard
+      - scripts_spec_unshard
+      - scripts_spec_summary
+    test_strategy: contract
+    tdd_focus:
+      - "shard.py: features[] 를 area 별 디렉터리에 분할 · area 미지정 features 는 'misc/'
+        fallback"
+      - "unshard.py: 분할된 결과를 원본 monolithic 형태로 복원 (round-trip)"
+      - "summary.py: features index 도출 (id · name · status · area · digest 만)"
+      - shard 가 features 외 top-level (project · domain · constraints ·
+        deliverable · metadata) 는 그대로 보존
+      - "round-trip: yaml.safe_load 의 결과가 원본 spec 의 결과와 동일 (key 순서 무시)"
+  - id: F-031
+    name: Scaling stress test — 1000/3000/10000 features latency 측정
+    type: feature
+    modules:
+      - tests_scale_dir
+      - fake_spec_generator
+      - latency_table_output
+    test_strategy: performance
+    tdd_focus:
+      - tests/scale/ 디렉터리 + __init__.py + test_scale.py 존재
+      - "fake spec 생성 helper: feature 개수 N 받아 valid spec dict 반환"
+      - 각 N (100, 1000, 3000, 10000) 에 대해 validate · canonical_hash · check 의
+        walltime 측정 + 출력
+      - tests/unit unittest discover 가 tests/scale 를 잡지 않음 (수동 호출 only)
+  - id: F-032
+    name: cosmic-suika ISSUES-LOG 일괄 환원 (I-003 / I-004 / I-006 / I-007)
+    type: feature
+    modules:
+      - starter_tsconfig_template
+      - schema_risks_id_pattern_relax
+      - kind_trivial_documentation
+      - schema_changelog_version_optional
+    test_strategy: contract
+    tdd_focus:
+      - "docs/templates/starter/tsconfig.json.template 존재 + 권장값
+        (allowImportingTsExtensions: true · types: ['vitest/globals']) + 주석 풍부"
+      - spec.schema.json 의 risks[].id pattern 이 R-N · RISK-N 양쪽 매치 (테스트가 둘 다
+        validate 통과)
+      - work.md + work.py docstring 에 'kind=trivial' 언급 + 의미 (Iron Law 면제 X · 단지
+        의도 표시)
+      - spec.schema.json 의 $defs/changelog.items.required 에서 'version' 제거 →
+        version 없는 entry 도 validate
+      - 기존 869 tests 회귀 없음 + 4 신규 tests
+  - id: F-033
+    name: Audit pass — stale rename, work.py archive wiring, README/CLAUDE.md
+      refresh, dogfood log
+    type: feature
+    modules:
+      - docs_setup_local_install_rename
+      - docs_setup_first_run_checklist_rename
+      - templates_starter_claude_md_template_rename
+      - readme_version_badge_refresh
+      - claude_md_root_refresh
+      - work_py_archive_at_wire
+      - dogfood_issues_log_seed
+    test_strategy: contract
+    tdd_focus:
+      - "docs/setup/local-install.md · first-run-checklist.md ·
+        templates/starter/CLAUDE.md.template 모두 /harness: 0건 (단 historical
+        /harness:status 같은 deprecated 명령은 의도적 잔존 가능 — 그건 commands/ 외 docs 만 검사)"
+      - README.md grep 'v0.10.7' ≥ 1 · 'v0.9.6' 0 (배지)
+      - CLAUDE.md (루트) grep 'v0.10.7' ≥ 1 · 'v0.10.3' 0 또는 historical 컨텍스트만
+      - scripts/work.py archive 함수가 archived_at = ISO8601 UTC 자동 기록
+      - .harness/_workspace/issues-log.md 존재 + ≥ 1 entry
+  - id: F-034
+    name: Phase 2 pre-commit hook — work.py 사이클 자동 enforcement
+    type: feature
+    modules:
+      - hooks_pre_commit_phase2_sh
+      - scripts_install_pre_commit
+      - pre_commit_whitelist_logic
+    test_strategy: contract
+    tdd_focus:
+      - hook 가 .harness/state.yaml 부재 시 silent exit 0 (Phase 2 안 쓰는 프로젝트)
+      - HARNESS_BYPASS_PRE_COMMIT=1 → exit 0
+      - staged 가 화이트리스트 (state.yaml · _workspace/* · CHANGELOG.md) 만이면 exit 0
+      - non-whitelisted staged + active feature 없음 → exit 1 + stderr 에 4 우회 옵션 출력
+      - non-whitelisted staged + active feature 있음 → exit 0
+      - installer 가 기존 .git/hooks/pre-commit 보존 (--force 옵션 시만 덮어씀)
+  - id: F-035
+    name: gate_5 browser smoke auto-detect (gstack /qa 환원 · cosmic-suika I-010 root
+      fix)
+    type: feature
+    modules:
+      - gate_runner_playwright_detect
+      - gate_runner_cypress_detect
+      - gate_5_priority_reorder
+    test_strategy: contract
+    tdd_focus:
+      - playwright.config.{ts,js,mjs} 존재 시 detect_gate_5_command 가 ['npx',
+        'playwright', 'test'] 반환
+      - cypress.config.{ts,js,mjs} 존재 시 ['npx', 'cypress', 'run'] 반환
+      - scripts/smoke.sh 가 여전히 가장 우선 (회귀 X)
+      - playwright/cypress 가 npm scripts.smoke 보다 우선 — 직접 framework 채택이 명시된 npm
+        script 보다 강한 의도 신호
+      - tests/smoke/ unittest fallback 은 마지막 (회귀 X)
+  - id: F-036
+    name: brownfield repo seed — init option 3 (Layer A · 1-shot reconnaissance)
+    type: feature
+    modules:
+      - scripts/scan/manifest
+      - scripts/scan/structure
+      - scripts/scan/seed_spec
+      - skills/spec-conversion/adapters/brownfield
+      - commands/init.md option 3 branch
+    test_strategy: tdd
+    tdd_focus:
+      - "manifest.py: package.json → runtime=node + language=js|ts + test runner
+        detect"
+      - "manifest.py: pyproject.toml → runtime=python + test=pytest"
+      - "manifest.py: Cargo.toml → runtime=rust"
+      - "manifest.py: go.mod → runtime=go"
+      - "structure.py: top dirs ignore
+        .git/node_modules/__pycache__/.venv/dist/build/.harness"
+      - "structure.py: ADR dir detect (docs/adr/, docs/decisions/)"
+      - "structure.py: entity candidate files (models.py, schemas/, *.entity.ts)"
+      - "seed_spec.py: composed dict passes spec/validate.py"
+      - "seed_spec.py: skip path is byte-equal to starter template (option 1
+        parity)"
+      - "seed_spec.py: metadata.source.origin == 'existing_code', maturity ==
+        'implementation'"
+      - "seed_spec.py: walking-skeleton F-0 auto-inserted"
+      - "seed_spec.py: empty repo (no manifests) returns starter-template
+        equivalent (graceful fallback)"
+      - "draft marker on LLM-seeded entities (_status: draft or description
+        suffix)"
+  - id: F-037
+    name: brownfield repo seed — work-activate fog clear (Layer B · per-feature
+      reconnaissance)
+    type: feature
+    modules:
+      - scripts/scan/area_resolver
+      - scripts/scan/style_fingerprint
+      - scripts/scan/chapter_writer
+      - scripts/work.py
+      - scripts/ceremonies/kickoff.py
+    test_strategy: tdd
+    tdd_focus:
+      - "area_resolver: dotted path file/dir/bare-name 매핑 + sibling cluster
+        collapse + deterministic slug"
+      - "style_fingerprint: formatter (ruff/black/prettier) · linter
+        (eslint/ruff) · naming (snake/camel) · test_pattern · lru_cache hit"
+      - "chapter_writer: byte-stable rewrite + user-edit sigil region 보존 +
+        _provenance frontmatter"
+      - "_autowire_fog_clear: silent-skip guards (no spec, fog.disabled,
+        --no-fog, modules empty) · idempotent · order before kickoff"
+      - "kickoff style block: chapter 있으면 '## 기존 스타일 컨텍스트' 섹션 emit · 없으면 zero
+        diff (회귀 보호)"
+      - "schema additive: 11 sample 회귀 0 + 새 fixture 가 모든 신규 field 사용해도 valid"
+  - id: F-038
+    name: work agent routing transparency
+    type: feature
+    modules:
+      - scripts/work.py
+      - scripts/ui/dashboard.py
+      - commands/work.md
+    test_strategy: tdd
+    tdd_focus:
+      - WorkResult.routed_agents (list[str]) — activate 시점에
+        kickoff.detect_shapes + agents_for_shapes 결과로 채움
+      - "format_human(): activate 액션이면 'routed agents: backend-engineer,
+        software-engineer, ...' 한 줄 출력"
+      - JSON 출력에도 routed_agents 키 (downstream tooling 친화)
+      - "dashboard: active feature 가 있으면 'agent chain' 섹션 —
+        kickoff.detect_shapes + agents_for_shapes"
+      - 회귀 0 — 비-activate 액션 (gate / evidence / complete) 의 출력은 그대로
+  - id: F-039
+    name: parallel agent dispatch (visibility + orchestrator contract)
+    type: feature
+    modules:
+      - scripts/ceremonies/kickoff.py
+      - scripts/work.py
+      - scripts/ui/dashboard.py
+      - agents/orchestrator.md
+      - commands/work.md
+    test_strategy: tdd
+    tdd_focus:
+      - "kickoff.PARALLEL_GROUPS — sensitive_or_auth: (security-engineer,
+        reviewer); ui_surface.present: (visual-designer, audio-designer)"
+      - "parallel_groups_for_shapes(shapes, has_audio): has_audio=False 면
+        audio-designer drop → 단원 그룹 제거"
+      - WorkResult.parallel_groups (default_factory=list) + activate() 가 채움
+      - format_human 의 routed agents 라인이 그룹 표기 — a → (b ∥ c) → d. 그룹 없으면 기존 ', '
+        join (회귀 0)
+      - dashboard agent chain 줄 동일 그룹 표기
+  - id: F-040
+    name: user-friendly output — i18n + glossary + visual signature
+    type: feature
+    modules:
+      - scripts/ui/lang.py
+      - scripts/ui/messages.py
+      - scripts/work.py
+      - scripts/ui/dashboard.py
+      - docs/schemas/spec.schema.json
+      - commands/work.md
+      - commands/init.md
+    test_strategy: tdd
+    tdd_focus:
+      - "lang.resolve_lang(): env HARNESS_LANG > spec.project.language >
+        LC_ALL/LANG zh/ko/en 감지 > 'en' fallback"
+      - "messages.t(key, lang): 미존재 키는 KeyError, 미존재 lang 은 'en' fallback"
+      - format_human() 의 라벨이 lang=ko 일 때 한국어, lang=en 일 때 영어
+      - dashboard.render() 의 라벨도 동일 규칙
+      - spec.schema 의 project.language enum ['en', 'ko', 'auto'] additive — 11
+        sample 회귀 0
+      - 기본값 (lang 미지정) 영어 — 외부 dev 진입 보호
+  - id: F-041
+    name: commands/ + agents/ rewrite at native-English level
+    type: feature
+    modules:
+      - commands/init.md
+      - commands/work.md
+      - agents/orchestrator.md
+      - agents/software-engineer.md
+      - agents/reviewer.md
+      - agents/backend-engineer.md
+      - agents/frontend-engineer.md
+      - agents/security-engineer.md
+      - agents/a11y-auditor.md
+      - agents/qa-engineer.md
+      - agents/integrator.md
+      - agents/tech-writer.md
+      - agents/performance-engineer.md
+      - agents/audio-designer.md
+      - agents/visual-designer.md
+      - agents/ux-architect.md
+      - agents/researcher.md
+      - agents/product-planner.md
+      - agents/README.md
+      - docs/glossary/BRAND_TERMS.md
+      - docs/i18n/README.md
+    test_strategy: contract
+    tdd_focus:
+      - no Korean script (gana/hangul block U+AC00..U+D7AF) anywhere in
+        commands/*.md or agents/*.md
+      - Preamble line + NO skip / NO shortcut prefixes survive every rewrite
+        (self_check step 5)
+      - frontmatter (name / description / tools) preserved on every agent;
+        description field also English
+      - "agents header style # <name> — <one-liner>"
+      - docs/i18n/ko/ snapshot byte-matches the pre-rewrite git source
+      - 11/11 sample specs continue to validate; 1062 unit + 6 integration tests
+        unchanged
+  - id: F-042
+    name: doc cleanup — dead docs + duplicate consolidation + Preamble central spec
+    type: feature
+    modules:
+      - docs/setup/local-install.md
+      - docs/release/v0.1.0.md
+      - docs/i18n/ko/
+      - README.md
+      - docs/setup/first-run-checklist.md
+      - docs/preamble-spec.md
+      - commands/init.md
+      - commands/work.md
+      - agents/README.md
+    test_strategy: contract
+    tdd_focus:
+      - self_check.sh 5/5 통과 — Preamble · NO skip · NO shortcut prefix 보존
+        invariant
+      - 1062 unit + 26 integration tests 회귀 0
+      - 삭제 대상 파일이 다른 곳에서 link/import 되지 않음 (검증 grep)
+      - docs/preamble-spec.md 가 self_check 의 새 5/5+ step 으로 grep 검증되거나 단순
+        reference
+  - id: F-043
+    name: hardcode externalization — single source of truth for
+      routing/gates/render/limits
+    type: feature
+    modules:
+      - scripts/core/gates
+      - scripts/core/routing
+      - scripts/ui/render
+      - scripts/ui/dashboard_config
+      - scripts/work.py
+      - scripts/ui/dashboard.py
+      - scripts/ceremonies/kickoff.py
+      - scripts/check.py
+    test_strategy: tdd
+    tdd_focus:
+      - "core/gates.py: STANDARD_GATES tuple 단일 source — 기존 work._STANDARD_GATES
+        와 동일 값"
+      - "core/routing.py: ROUTING_SHAPES + PARALLEL_GROUPS 이전 — kickoff.py 는
+        re-export 로 backward-compat"
+      - "ui/render.py: render_agent_chain(agents, groups) — work.py 의
+        _render_agent_chain + dashboard.py 의 _render_chain 동일 출력"
+      - "ui/dashboard_config.py: MAX_OTHER_LIST 등 — env
+        HARNESS_DASHBOARD_MAX_OTHER 로 override 가능"
+      - 1062 unit + 26 integration regression 0
+      - self_check.sh 5/5 PASS
+  - id: F-044
+    name: spec archive flow — F-029 fields activation + work.py --archive
+    type: feature
+    modules:
+      - scripts/spec/archive
+      - scripts/work.py
+      - scripts/ui/dashboard.py
+      - .harness/spec.yaml
+      - docs/samples/harness-boot-self/spec.yaml
+    test_strategy: tdd
+    tdd_focus:
+      - "scripts/spec/archive.py: archive_feature(harness_dir, fid, reason) —
+        spec.yaml 에 archived_at + archive_reason 채움 + state.yaml
+        status=archived"
+      - work.py --archive F-N --reason 'X' CLI 진입로 — 기존 --remove 와 다름 (--remove
+        는 entry 삭제, --archive 는 lifecycle marker)
+      - F-001~F-010 in-place archive 마킹 (양쪽 spec mirror)
+      - "events.log: feature_archived event"
+      - "dashboard: archived features 가 'pending' / 'in_progress' / 'on hold'
+        어디에도 안 나타남 (별도 표시 안 해도 OK, 단순 숨김)"
+  - id: F-045
+    name: work.py + check.py facade-preserving split (sibling pattern)
+    type: feature
+    modules:
+      - scripts/work.py
+      - scripts/work_internals.py
+      - scripts/work_autowire.py
+      - scripts/work_cli.py
+      - scripts/check.py
+      - scripts/check_detectors.py
+      - scripts/check_report.py
+    test_strategy: tdd
+    tdd_focus:
+      - "scripts/work.py: 100 줄 안쪽 facade — 모든 public 이름이 sibling 에서 re-export"
+      - 기존 callsite (from work import activate / WorkResult 등) 모두 동작
+      - "scripts/check.py: facade + 8 drift detectors → registry pattern
+        (DRIFT_CHECKS dict)"
+      - 1077 unit + 26 integration tests 회귀 0
+      - self_check.sh 5/5 PASS (commands/*.md preamble 검증)
+  - id: F-046
+    name: tests/ namespace cleanup — work / scan / dashboard / kickoff sub-dirs
+    type: feature
+    modules:
+      - tests/unit/work/
+      - tests/unit/scan/
+      - tests/unit/dashboard/
+      - tests/unit/kickoff/
+    test_strategy: contract
+    tdd_focus:
+      - tests/unit/work/ 디렉토리 생성 + 7 파일 이동 (test_work*.py)
+      - tests/unit/scan/ 디렉토리 + 6 파일 (test_scan_*.py)
+      - tests/unit/dashboard/ 디렉토리 + 4 파일 (test_dashboard*.py)
+      - tests/unit/kickoff/ 디렉토리 + 3 파일 (test_kickoff*.py)
+      - pytest auto-discovery 그대로 동작 (testpaths=tests/unit + recursive)
+      - 1084 unit + 26 integration regression 0
+  - id: F-047
+    name: vision consolidation — 6-release thread close + v0.11.0 minor bump
+    type: feature
+    modules:
+      - .harness/spec.yaml
+      - docs/samples/harness-boot-self/spec.yaml
+      - CHANGELOG.md
+      - CLAUDE.md
+      - .claude-plugin/plugin.json
+    test_strategy: contract
+    tdd_focus:
+      - F-001~F-010 양쪽 spec.yaml mirror 에 archived_at + archive_reason 추가
+      - self_check 5/5 — spec mirror diff -q 통과 + validate
+      - 1084 unit + 26 integration regression 0
+      - CHANGELOG 의 v0.11.0 entry 가 6 release thread (F-042~F-047) 종합 + 이전
+        thread (F-036~F-041 fog/transparency/parallel/i18n/native-en) 와의 연결
+  - id: F-048
+    name: drift × Iron Law gating — complete() blocks on error-severity drift
+    type: feature
+    modules:
+      - scripts/work.py
+      - scripts/check.py
+      - tests/unit/work/test_drift_iron_law_gate.py
+    test_strategy: contract
+    tdd_focus:
+      - drift 0 → complete 통과 (기존 동작 유지)
+      - error-severity drift 1+ → complete 거부, kinds 메시지 노출
+      - warn-severity drift 만 있을 때 → 통과 (binary blocking)
+      - hotfix_reason override → drift 무시하고 진행 (escape hatch)
+      - 다른 feature 의 complete 에 미치는 영향 0 (per-feature 격리 유지)
+  - id: F-049
+    name: "native English consolidation — Phase 1: entry-point dev surfaces"
+    type: feature
+    modules:
+      - CLAUDE.md
+      - .harness/README.md
+      - docs/i18n/README.md
+      - docs/protocols/README.md
+      - docs/protocols/sync-to-work-handoff.md
+      - docs/templates/hooks/README.md
+      - docs/samples/harness-boot-self/README.md
+      - hooks/pre-commit-phase2.sh
+      - hooks/prompt-log.sh
+    test_strategy: contract
+    tdd_focus:
+      - Zero Korean characters [가-힣] in the 9 listed modules
+      - self_check 5/5 passes (diff -q, validate, sync, check, preamble grep)
+      - 1119+ tests pass with no regression
+      - BRAND_TERMS.md KO column preserved (intended bilingual reference)
+      - docs/i18n/README.md keeps KO examples that demonstrate i18n policy itself
+  - id: F-050
+    name: "native English consolidation — Phase 2: spec mirrors + JSONSchema"
+    type: feature
+    modules:
+      - docs/schemas/spec.schema.json
+      - docs/samples/harness-boot-self/spec.yaml
+      - .harness/spec.yaml
+    test_strategy: contract
+    tdd_focus:
+      - Korean characters drop dramatically across the three module files
+        (precise zero is a stretch goal — bilingual glossary entries stay)
+      - self_check 5/5 PASS — both mirrors identical, validate happy, sync
+        clean, drift zero, preamble grep green
+      - 1117 unit + integration tests PASS, regression 0
+      - JSONSchema description fields parse as valid JSONSchema 2020-12
+  - id: F-051
+    name: "native English consolidation — Phase 2b: features[] description bodies"
+    type: feature
+    modules:
+      - docs/samples/harness-boot-self/spec.yaml
+      - .harness/spec.yaml
+    test_strategy: contract
+    tdd_focus:
+      - Korean character count drops sharply from 666 → < 300 across active
+        features
+      - self_check 5/5 PASS — diff -q + validate stay green
+      - 1117 tests PASS, regression 0
+      - Archived features (F-001~F-010 with archived_at) untouched as history
+  - id: F-052
+    name: "native English consolidation — Phase 3: scripts/ Python docstrings"
+    type: feature
+    modules:
+      - scripts/
+    test_strategy: contract
+    tdd_focus:
+      - Korean character count under scripts/ drops to 0 (or near-zero, with any
+        intentional KO clearly marked)
+      - 1117 tests PASS, regression 0 — no test breakage from docstring changes
+      - self_check 5/5 PASS
+  - id: F-053
+    name: "native English consolidation — Phase 4: tests/ Python docstrings"
+    type: feature
+    modules:
+      - tests/
+    test_strategy: contract
+    tdd_focus:
+      - Korean character count under tests/ drops to 0 (or near-zero, with any
+        intentional KO clearly marked)
+      - 1117 tests PASS, regression 0
+      - self_check 5/5 PASS
+  - id: F-054
+    name: "native English consolidation — Phase 5: CHANGELOG
+      English-only-going-forward policy"
+    type: feature
+    modules:
+      - CHANGELOG.md
+    test_strategy: contract
+    tdd_focus:
+      - CHANGELOG header carries an explicit English-only-going-forward marker
+      - Existing release notes preserved verbatim (history)
+  - id: F-055
+    name: external-impression cleanup — refresh commands/work.md from v0.3 tense to
+      current v0.11.x state
+    type: feature
+    modules:
+      - commands/work.md
+    test_strategy: contract
+    tdd_focus:
+      - commands/work.md no longer claims gate_5 automation is out of scope
+      - (v0.3.X+) historical markers removed from gate auto-detect bullets
+      - Preamble block + Subcommands list semantics unchanged
+  - id: F-056
+    name: README Five Strengths terminology refinement — Context heading +
+      intermediate-language framing
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - ① heading reads Context / 컨텍스트 in both mirrors
+      - Body wording carries 'intermediate language' / '중간언어(명세)'
+      - ③ EN sub-text reads (the rules)
+      - Status line reads v0.11.5 in both mirrors
+  - id: F-057
+    name: README hero diagram ① sub-text refinement — input → mechanism (conversion
+      / 변환)
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - ① diagram sub-text reads (conversion) in EN and (변환) in KO
+      - Other four sub-texts unchanged
+      - Heading row unchanged (Context · Evolve · Focus · Collaborate · Unify)
+  - id: F-058
+    name: README first-impression polish — Quick start, portfolio Preview,
+      conversation rewrite
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - Quick start lists both /harness-boot:init forms (idea + plan.md)
+      - Built with harness-boot table carries a Preview column
+      - A short conversation reads as a happy path with no <4-option escalation>
+      - KO mirror tracks EN structurally
+  - id: F-059
+    name: README ① heading verb consistency + conversation example jargon balance
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - All five diagram main labels read as verbs
+      - ① diagram main = Convert / 변환; sub-text = (the context) / (컨텍스트)
+      - Table row 1 heading = Convert / 변환; body uses verb form (convert into /
+        변환합니다)
+      - Conversation example pairs each system term with a parenthetical gloss
+  - id: F-060
+    name: README KO conversation — status values to English (PASS / SKIPPED) for
+      legibility + runtime parity
+    type: feature
+    modules:
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - KO conversation example uses PASS / SKIPPED instead of 통과 / 건너뜀
+      - Surrounding prose remains Korean (Iron Law 충족 etc.)
+      - EN README untouched
+  - id: F-061
+    name: User-facing message swap — friendly main + system identifier in parens
+      (display layer)
+    type: feature
+    modules:
+      - scripts/work.py
+      - scripts/gate/runner.py
+      - README.md
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - GATE_FRIENDLY dict maps all 7 gate ids (gate_0..gate_5, gate_perf)
+      - run_and_record_gate result message uses friendly-main format
+      - complete-rejection message uses friendly-main format
+      - README conversation examples (EN + KO) use friendly-main format
+      - Internal layer untouched (state.yaml keys, CLI args, function names)
+  - id: F-062
+    name: cosmic-suika portfolio preview — placeholder → actual PNG image
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+      - docs/assets/README.md
+    test_strategy: contract
+    tdd_focus:
+      - README portfolio Preview cell renders an actual <img> with width=240
+      - Image links to the live demo URL
+      - docs/assets/README.md no longer marks cosmic-suika as placeholder
+  - id: F-063
+    name: README.ko cosmic-suika description — 머지 → 수박
+    type: feature
+    modules:
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - KO row reads '우주 테마 수박 게임'
+      - EN row unchanged
+  - id: F-064
+    name: README copy polish — image format softening + assets guide EN + license
+      line tagline
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+      - docs/assets/README.md
+    test_strategy: contract
+    tdd_focus:
+      - Built-with copy invites any image format with 'optimize on merge'
+      - docs/assets/README.md is fully English
+      - License line shows 'Free to use, free to fork.' verbatim in both
+        mirrors; no maintainer ID
+  - id: F-065
+    name: Built-with contribution flow — OSS-standard PR-first guidance
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+      - docs/assets/README.md
+    test_strategy: contract
+    tdd_focus:
+      - Built-with line names PR first, issue second
+      - Both mirrors mention 'copy an existing row' / '기존 행을 복사' template hint
+      - docs/assets/README.md Option A carries a (recommended) label
+  - id: F-066
+    name: docs/assets/README.md fact fix — assets are wired by hand, not
+      auto-referenced
+    type: feature
+    modules:
+      - docs/assets/README.md
+    test_strategy: contract
+    tdd_focus:
+      - Trailing line of docs/assets/README.md no longer claims automatic
+        referencing
+  - id: F-067
+    name: docs/assets/README.md trailing line — trim the redundant mantra
+    type: feature
+    modules:
+      - docs/assets/README.md
+    test_strategy: contract
+    tdd_focus:
+      - Trailing summary line removed; How to add is the file's last block
+  - id: F-068
+    name: plugin.json keywords refresh ahead of marketplace submission
+    type: feature
+    modules:
+      - .claude-plugin/plugin.json
+    test_strategy: contract
+    tdd_focus:
+      - keywords array contains all five user-requested tags
+      - claude-code preserved as platform tag
+      - no removed-tag remnants (agent-workflow / walking-skeleton)
+  - id: F-069
+    name: README manual install guide + marketplace status note
+    type: feature
+    modules:
+      - README.md
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - Manual install section appears after Quick start in both READMEs
+      - Section uses only the verified absolute-path marketplace-add flow
+      - One-line note clarifies the plugin is not on the official marketplace
+      - Bash command sequences match between English and Korean versions
+  - id: F-070
+    name: complete-time working tree guard + canonical commit sequence
+    type: feature
+    modules:
+      - scripts/work.py
+      - commands/work.md
+      - tests/unit/test_work.py
+    test_strategy: tdd
+    tdd_focus:
+      - complete() rejects when project working tree is dirty
+      - complete() rejects when staging area has uncommitted changes
+      - complete() proceeds normally when working tree is clean
+      - non-git projects bypass the guard silently
+      - rejection message names the canonical sequence
+      - hotfix_reason does not bypass the working tree guard
+  - id: F-071
+    name: README.ko.md manual install — native Korean rewrite
+    type: feature
+    modules:
+      - README.ko.md
+    test_strategy: contract
+    tdd_focus:
+      - Korean section reads as native Korean prose (no '·' noun lists, no 'X
+        덕분에 Y' calques)
+      - Information content matches README.md (git clone URL, marketplace add
+        absolute path, install command, marketplace status note)
+      - English README is untouched
+  - id: F-072
+    name: complete() drift gating — blocking-only fast path
+    type: feature
+    modules:
+      - scripts/check.py
+      - scripts/work.py
+      - tests/unit/test_check.py
+    test_strategy: contract
+    tdd_focus:
+      - run_blocking_check exists and returns a CheckReport
+      - run_blocking_check populates checked with exactly the three blocking
+        kinds (Code, Stale, AnchorIntegration)
+      - run_blocking_check does not invoke non-blocking detectors (mock
+        check_evidence/check_doc/check_protocol/check_spec/check_generated/check_derived/check_includes/check_anchor/check_adr_supersedes
+        — call_count == 0)
+      - complete() now calls run_blocking_check, not run_check (replacement
+        assertion)
+      - F-048 existing contract preserved — drift error in {Code, Stale,
+        AnchorIntegration} still blocks complete(), warn-only or
+        non-blocking-kind error still passes
+  - id: F-075
+    name: Initial sync auto-wire — work.py activate fires sync.run when never synced
+    type: feature
+    modules:
+      - scripts/work.py
+      - tests/unit/work/test_work_autowire.py
+    test_strategy: tdd
+    tdd_focus:
+      - _autowire_initial_sync exists and runs before _autowire_fog_clear /
+        _autowire_kickoff inside activate()
+      - fresh harness (spec.yaml present, harness.yaml.generated_from.spec_hash
+        empty) triggers a sync that populates spec_hash and renders domain.md +
+        architecture.yaml
+      - already-synced harness (spec_hash non-empty) is a no-op — sync.run is
+        not invoked again
+      - sync.run failure is fail-open — activate completes, stderr carries the
+        warning, state.yaml still transitions
+      - missing spec.yaml or missing harness.yaml is a silent no-op (symmetry
+        with sibling autowires)
+  - id: F-076
+    name: Upstream sync wiring — init.md + spec-conversion finalize call
+      try_initial_sync
+    type: feature
+    modules:
+      - scripts/sync.py
+      - scripts/work.py
+      - commands/init.md
+      - skills/spec-conversion/SKILL.md
+      - tests/unit/test_sync.py
+      - tests/unit/work/test_work_autowire.py
+    test_strategy: tdd
+    tdd_focus:
+      - sync.try_initial_sync exists, returns dict {ok,reason,skipped}, never
+        raises
+      - try_initial_sync skips when harness.yaml.spec_hash already populated
+        (skipped=True, ok=True)
+      - try_initial_sync soft-fails on schema-invalid spec.yaml (ok=False,
+        reason carries class name) without raising
+      - sync.py --soft CLI flag prints status line + always exits 0
+      - _autowire_initial_sync delegates to try_initial_sync and preserves the
+        stderr `[warn]` contract from F-075
+      - commands/init.md contains a `python3 .* sync.py .* --soft` invocation
+        between §5 and §6
+      - skills/spec-conversion/SKILL.md contains the same invocation in its
+        post-Stage-4 finalize block
+  - id: F-077
+    name: AC quantitative claim lint — surface description vs AC numeric mismatch at
+      activate
+    type: feature
+    modules:
+      - scripts/spec/quant_claims.py
+      - scripts/work.py
+      - tests/unit/test_quant_claims.py
+      - tests/unit/work/test_work_autowire.py
+    test_strategy: tdd
+    tdd_focus:
+      - extract_numeric_claims(text) returns list[{metric, value, span}] for
+        canonical patterns
+      - diff_claims(description, ac) returns list of mismatches where
+        description value > AC value for the same metric
+      - scripts/work.py:_autowire_quant_lint() writes
+        _workspace/coverage/F-N.yaml fingerprint at activate and prints stderr
+        hint for each mismatch
+      - lint is fail-open — exception inside extractor never raises out of
+        activate
+      - no mismatch (description matches or absent numbers) emits no stderr
+  - id: F-078
+    name: 13th drift kind — Coverage detector turns quant lint into a complete()
+      blocker
+    type: feature
+    modules:
+      - scripts/check.py
+      - scripts/work.py
+      - tests/unit/test_check.py
+      - tests/unit/work/test_drift_iron_law_gate.py
+    test_strategy: tdd
+    tdd_focus:
+      - check_spec_coverage emits Coverage findings with severity='error' for
+        mismatches whose ratio < threshold (default 0.80)
+      - threshold honored from harness.yaml.coverage.threshold override (test
+        with 0.50 → previous error becomes clean)
+      - missing _workspace/coverage directory → empty findings (no exception)
+      - fingerprint with empty mismatches list → no findings
+      - run_check appends 'Coverage' to checked list and includes detector
+        findings
+      - run_blocking_check (F-072 fast path) also appends 'Coverage' to checked
+        + invokes check_spec_coverage
+      - _BLOCKING_DRIFT_KINDS in scripts/work.py contains 'Coverage' (preserves
+        F-048's gate semantics)
+      - complete() rejects when Coverage finding present (severity error) and
+        accepts when --hotfix-reason supplied
+  - id: F-079
+    name: Dashboard coverage gauge — surface F-077 fingerprint percentages without
+      invoking check.py
+    type: feature
+    modules:
+      - scripts/ui/dashboard.py
+      - scripts/ui/intent_planner.py
+      - scripts/work.py
+      - tests/unit/test_dashboard.py
+      - tests/unit/test_intent_planner.py
+    test_strategy: tdd
+    tdd_focus:
+      - _load_coverage(harness_dir, fid) returns float in [0,1] when fingerprint
+        has mismatches; returns None when fingerprint missing or empty
+      - _render_active_block emits a coverage line when harness_dir provided and
+        coverage < 1.0
+      - _render_coverage_debt section counts features with at least one mismatch
+        and features below threshold
+      - alert line rendered when below-threshold count > 5
+      - intent_planner suggests 'review carry-forward debt' when active feature
+        coverage < threshold
+      - render() backward compat — harness_dir omitted produces identical output
+        to the v0.11.x baseline
+  - id: F-080
+    name: v0.12.0 substantive coverage validation — synthetic replay + integration
+      regression
+    type: feature
+    modules:
+      - tests/integration/test_iron_law_substantive.py
+      - docs/dogfood-replay-v0.12.0.md
+    test_strategy: tdd
+    tdd_focus:
+      - subprocess-driven replay through scripts/work.py — exercises the same
+        wiring users hit, not the unit layer
+      - activate emits stderr [hint] line for description claims that exceed AC
+        for the same metric
+      - _workspace/coverage/F-N.yaml fingerprint persists with non-empty
+        mismatches list
+      - complete() returns action='queried' and message contains 'Coverage' when
+        fingerprint shows under-coverage
+      - complete --hotfix-reason produces action='completed' and the feature
+        transitions to done
+      - docs report captures stdout/stderr verbatim from the replay so the
+        evidence is human-readable
+  - id: F-081
+    name: Graceful import degradation — dashboard works without tomli, sync --soft
+      exits 0 without pyyaml
+    type: feature
+    modules:
+      - scripts/sync.py
+      - scripts/scan/style_fingerprint.py
+      - scripts/scan/manifest.py
+      - scripts/scan/seed_spec.py
+      - tests/unit/test_sync.py
+      - tests/unit/scan/test_style_fingerprint.py
+    test_strategy: tdd
+    tdd_focus:
+      - scripts/sync.py wraps `import yaml` so module load survives a missing
+        pyyaml
+      - scripts/sync.py:main() returns 0 when --soft + yaml missing (F-076
+        contract preserved)
+      - scripts/sync.py:main() returns 1 when strict + yaml missing (existing
+        behavior)
+      - scripts/scan/{style_fingerprint,manifest,seed_spec}.py wrap
+        tomllib/tomli in nested try/except — sets `tomllib = None` when neither
+        is present
+      - "_pyproject_has and other tomllib.loads sites guard with `if tomllib is
+        None: return False` (or equivalent skip)"
+      - Existing dashboard / sync flows are unchanged when deps are present
+        (regression 0)
+  - id: F-082
+    name: Init dep preflight — ask user before pip install (F-082 paired with F-081)
+    type: feature
+    modules:
+      - commands/init.md
+      - tests/unit/test_init_md_preflight_contract.py
+    test_strategy: contract
+    tdd_focus:
+      - commands/init.md gains a §0.5 'Optional dependency preflight' section
+        between §0 and §1
+      - the section's bash block runs `python3 -c "import yaml"` and the `import
+        tomllib || import tomli` chain
+      - the section instructs Claude to ask the user (yes/no/venv) before any
+        pip invocation
+      - the `yes` branch references `python3 -m pip install --user`; the `no`
+        branch references degraded mode + later-install command; the `venv`
+        branch references `python3 -m venv .venv`
+      - the PEP 668 fallback is documented (one extra round-trip ask before
+        --break-system-packages)
+      - init.md never aborts init on dep failure — F-081 backstop handles
+        whatever the user chose
+  - id: F-084
+    name: v1.0 TypeScript migration — foundation (project setup + canonical_hash
+      port)
+    type: feature
+    modules:
+      - package.json
+      - tsconfig.json
+      - vitest.config.ts
+      - .eslintrc.json
+      - .prettierrc.json
+      - src/core/canonicalHash.ts
+      - tests/parity/canonicalHash.test.ts
+      - tests/parity/fixtures/canonical_hash/
+    test_strategy: tdd
+    tdd_focus:
+      - "package.json declares yaml + smol-toml + zod + commander + vitest +
+        typescript + eslint + prettier; scripts: build, test, lint, format,
+        typecheck"
+      - tsconfig.json uses Google TS settings — strict mode, ES2022 target,
+        NodeNext module, no implicit any
+      - "src/core/canonicalHash.ts exports `canonicalHash(data: unknown):
+        string` matching scripts/core/canonical_hash.py:canonical_hash
+        signature"
+      - JSDoc class/function-level comments mandatory and in English (memory
+        `feedback_typescript_migration`)
+      - tests/parity/canonicalHash.test.ts loads Python-generated fixtures and
+        asserts byte-equal hash output
+      - vitest runs cleanly (`npm test` exits 0); ESLint + Prettier pass on src/
+        and tests/
+      - Existing Python tests (1204) still pass — TS port is additive, not
+        replacing yet
+  - id: F-085
+    name: TS migration — port core/eventLog.ts (events.log rotation + unified read)
+    type: feature
+    modules:
+      - src/core/eventLog.ts
+      - tests/parity/eventLog.test.ts
+      - tests/parity/fixtures/event_log/
+    test_strategy: tdd
+    tdd_focus:
+      - readEvents merges events.log + every events.log.YYYYMM, sorts ISO ts
+        ascending, never drops unparseable-ts events
+      - rotate splits older-than-current-month events into events.log.YYYYMM
+        buckets, preserves current month + unparseable in events.log
+      - rotate is idempotent — running twice produces identical disk state
+      - rotate appends to existing rotated files, never overwrites pre-existing
+        history
+      - parseYyyymmFromTs returns null on unparseable input, never throws
+      - JSDoc class/function-level English comments throughout
+  - id: F-086
+    name: TS migration — port core/state.ts (state.yaml read/write + Iron Law math)
+    type: feature
+    modules:
+      - src/core/state.ts
+      - tests/parity/state.test.ts
+      - tests/parity/fixtures/state/
+    test_strategy: tdd
+    tdd_focus:
+      - State.load reads existing state.yaml or returns default schema;
+        round-trips Python-written file
+      - ensureFeature / setStatus / recordGateResult / addEvidence /
+        addSkippedAgent mutate identically to Python
+      - setActive auto-creates feature entry; removeFeature returns boolean
+      - isDeclaredEvidence treats automatic kinds as non-counted, declared kinds
+        as counted
+      - countDeclaredEvidence honors trailing window, treats unparseable ts as
+        recent
+      - save produces YAML that Python's yaml.safe_load reads back identically
+      - JSDoc class/function-level English comments throughout
+  - id: F-087
+    name: TS migration — port core/pluginRoot.ts (4-strategy chain plugin root
+      resolver)
+    type: feature
+  - id: F-088
+    name: TS migration — port core/{projectMode,gates,routing}.ts (small core
+      constants)
+    type: feature
+  - id: F-089
+    name: TS migration — port spec/validate.ts (JSONSchema validation via ajv)
+    type: feature
+  - id: F-090
+    name: TS migration — port spec/{includeExpander,modeClassifier}.ts (sync runtime
+      path)
+    type: feature
+  - id: F-091
+    name: TS migration — port render/{architecture,domain}.ts (sync derived outputs)
+    type: feature
+  - id: F-092
+    name: TS migration — port
+      ui/{lang,messages,dashboardConfig,render,featureResolver}.ts (UI helper
+      cluster)
+    type: feature
+  - id: F-093
+    name: TS migration — port events.ts (events.log filter helpers)
+    type: feature
+  - id: F-094
+    name: TS migration — port status.ts (/harness:status read-only summary)
+    type: feature
+  - id: F-095
+    name: TS migration — port gate/runner.ts (gate 0-5 + perf auto-detection)
+    type: feature
+  - id: F-096
+    name: TS migration — port sync.ts (orchestrator wiring already-ported deps)
+    type: feature
+  - id: F-097
+    name: TS migration — port ceremonies/{kickoff,retro,designReview,inbox}.ts
+    type: feature
+  - id: F-098
+    name: TS migration — port metrics.ts (events.log aggregation, read-only)
+    type: feature
+  - id: F-099
+    name: TS migration — port ui/intentPlanner.ts (next-action suggestions)
+    type: feature
+  - id: F-100
+    name: TS migration — port check.ts (drift detection, 13 detectors)
+    type: feature
+  - id: F-101
+    name: TS migration — port scan/{structure,manifest,areaResolver}.ts
+    type: feature
+  - id: F-102
+    name: TS migration — port work.ts (lifecycle orchestrator, biggest single file)
+    type: feature
+  - id: F-103
+    name: TS migration — port ui/dashboard.ts (no-args dashboard renderer)
+    type: feature
+  - id: F-104
+    name: TS migration — bin/harness CLI shim (commander-based entry point)
+    type: feature
+  - id: F-105
+    name: TS migration audit — build + bin + parity verification (pre-v1.0 gate)
+    type: feature
+  - id: F-106
+    name: Repository cleanup — scripts/ → legacy/scripts/ + README sync
+    type: feature
+  - id: F-107
+    name: TS-only cutover — Python operational surface removed
+    type: feature
+  - id: F-108
+    name: Migration + functionality audit (post-cutover end-to-end review)
+    type: feature
+  - id: F-109
+    name: Install + CI verification (post-cutover supply chain)
+    type: feature
+  - id: F-110
+    name: Single-file bundle for plugin install (esbuild)
+    type: feature
+  - id: F-111
+    name: README dependency-section purge after bundle cutover
+    type: feature
+  - id: F-112
+    name: Drop the user-facing Node.js requirement line
+    type: feature
+  - id: F-113
+    name: Python ↔ TS coverage audit + 0.13.0 version lock
+    type: feature
+  - id: F-114
+    name: feature-author skill v0.1 — auto-trigger F-N entry authoring
+    type: feature
+  - id: F-115
+    name: feature-author skill — Anthropic guide alignment + Korean natural-phrasing
+      triggers
+    type: chore
+  - id: F-116
+    name: feature-author skill — live smoke template + walkthrough
+    type: chore
+  - id: F-117
+    name: Repo root cleanup — remove dead Python config after v0.13 TS-only cutover
+    type: chore
+  - id: F-118
+    name: Drive — Goal domain primitives (Stage 1 of v0.14.0)
+    type: feature
+    goal_id: G-001
+  - id: F-119
+    name: Drive — autonomous loop body (Stage 2 of v0.14.0)
+    type: feature
+    goal_id: G-001
+    status: planned
+  - id: F-120
+    name: harness work --gate two-arg parsing fix (commander variadic)
+    type: fix
+  - id: F-121
+    name: logcat-on ISSUES-LOG batch return (L-001/L-002/L-003)
+    type: fix
+  - id: F-122
+    name: driveLoopAndPlan.test.ts seedCheckpoint time-bomb fix
+    type: fix
+  - id: F-123
+    name: CLAUDE.md staleness refresh + harness.yaml spec hash sync
+    type: chore
+    test_strategy: smoke
+  - id: F-124
+    name: CLAUDE.md information architecture refactor — Step A (volatile-data
+      eviction)
+    type: chore
+    test_strategy: smoke
+  - id: F-125
+    name: Legacy Python source eviction from git tracking (local-only retention)
+    type: chore
+    test_strategy: smoke
+  - id: F-126
+    name: Quarantined Python test suite eviction (tests/unit + integration + scale)
+    type: chore
+    test_strategy: smoke
+  - id: F-127
+    name: F-034 pre-commit hook short-circuits during merge / cherry-pick / revert /
+      rebase
+    type: fix
+    test_strategy: smoke
+  - id: F-128
+    name: v0.14.3 release prep — CHANGELOG expansion + README sync + tag
+    type: chore
+    test_strategy: smoke
+  - id: F-129
+    name: perf_regression evidence kind + complete() guard
+    type: feature
+    test_strategy: tdd
+  - id: F-130
+    name: feature name length validator (≤100 char)
+    type: feature
+    test_strategy: tdd
+  - id: F-131
+    name: harness export-spec — done feature compaction (Lite)
+    type: feature
+    test_strategy: tdd
+  - id: F-132
+    name: complete() auto-archive — done feature body moves out of spec.yaml
+    type: feature
+    test_strategy: tdd
+  - id: F-133
+    name: F-132 follow-up — lifecycle artifact whitelist + archive lockstep
+    type: feature
+    test_strategy: smoke
+  - id: F-134
+    name: F-133 follow-up — extend whitelist to live spec.yaml
+    type: feature
+    test_strategy: smoke
+  - id: F-135
+    name: communication rules — answer-first format + native-tone for any user
+      language
+    type: feature
+    test_strategy: smoke
+  - id: F-136
+    name: communication rules v2 — single-language template + brevity for
+      IDs/commits/PRs/CHANGELOG
+    type: feature
+    test_strategy: smoke
+  - id: F-137
+    name: bulk archive migration in sync — auto-relocate existing done bodies
+    type: feature
+    test_strategy: smoke
+  - id: F-138
+    name: drive replan hook — adaptive feature-by-feature replanning (Lite)
+    type: feature
+    test_strategy: tdd
+  - id: F-139
+    name: drive mid-cycle real test — periodic system-level smoke during a goal
+    type: feature
+    test_strategy: tdd
+  - id: F-140
+    name: drive transient retry — auto-retry real_test_failed once before yielding
+    type: feature
+    test_strategy: tdd
+  - id: F-141
+    name: v0.15.0 release prep — minor bump for the 12-feature batch
+    type: chore
+    test_strategy: smoke
+  - id: F-142
+    name: drive hook trigger relaxation — fire on any unevaluated done feature
+    type: feature
+    test_strategy: tdd
+  - id: F-143
+    name: self-managing spec — auto digest + auto-archive open_q + retroactive
+      catch-up
+    type: feature
+    test_strategy: tdd
+    digest: "Closes the spec.yaml bloat axis end-to-end. Three additive behaviors
+      land in one cycle: 1. **Auto-digest on complete..."
+  - id: F-148
+    name: archive sidecar auto-import in starter CLAUDE.md template
+    type: feature
+    test_strategy: smoke
+    digest: 'Closes the v0.15.2 follow-up gap surfaced by the A/B "작업 결과물" audit:
+      every plugin-shipped import recommendation (`doc...'
+  - id: F-156
+    name: commands/work.md slim — ceremony + orchestration detail to sidecars
+    type: feature
+    test_strategy: smoke
+    digest: Cuts the single largest per-call input cost in the plugin —
+      `commands/work.md` was 28 KB / ~8 K tokens, paid on every...
+  - id: F-157
+    name: plan-mode file hygiene — 4-step cleanup discipline + external archive
+    type: feature
+    test_strategy: smoke
+    digest: Closes the long-running plan-file accumulation problem surfaced when
+      users iterate on the same axis across multiple p...
+  - id: F-158
+    name: init bench + skeleton-only safety net
+    type: feature
+    status: planned
+    release_target: v0.15.4
+    modules:
+      - init_command
+      - cli_init
+      - bench
+    test_strategy: smoke
+    digest: Lock in a measurable safety net before the larger init UX overhaul
+      (3-scenario auto-routing). This PR ships only the...
+  - id: F-159
+    name: scenario-1 idea → spec (researcher ticky-taka + draft label)
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - init_command
+      - scenario_idea
+      - draft_label
+      - token_log
+    test_strategy: smoke
+    digest: "First user-facing slice of the init UX overhaul (after the F-158 safety
+      net): when a user runs `/harness-boot:init` a..."
+  - id: F-160
+    name: scenario-3a codebase scan → conventions.md (Layer-0 deterministic)
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - init_command
+      - codebase_signals
+      - conventions_writer
+      - cli_init
+    test_strategy: smoke
+    digest: "Third slice of the init UX overhaul: when the project already has code,
+      the init flow runs deterministic Layer-0 sign..."
+  - id: F-161
+    name: scenario-3b secret guard + CLAUDE.md merge + LLM hook spec
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - init_command
+      - codebase_redact
+      - codebase_conflict
+      - cli_init
+    test_strategy: smoke
+    digest: "Closes the scenario-3 split. Three guards make brownfield init safe to
+      ship: 1. Secret redaction over every fact that..."
+  - id: F-162
+    name: scenario-2 plan_doc → spec (md auto-detect + spec-conversion handoff)
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - init_command
+      - scenario_plan_doc
+      - md_detect
+      - cli_init
+    test_strategy: smoke
+    digest: Fourth and final slice of the init UX overhaul. When the project root
+      carries a plan / requirements / architecture ma...
+  - id: F-163
+    name: conventions LLM hook fill — Comments + Tests sections + token accounting
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - cli_init
+      - conventions_fill
+      - token_log
+    test_strategy: smoke
+    digest: "Closes the F-161 \"[pending: LLM hook stub]\" placeholders in
+      `.harness/conventions.md`. The CLI itself doesn't call an..."
+  - id: F-164
+    name: sync self-block fix — dirty-tree whitelist for render outputs
+    type: fix
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - sync_command
+      - bulk_archive
+    test_strategy: tdd
+    digest: logcat-on ISSUES-LOG return (2026-05-13). The Phase 0 sync sequence runs
+      render (step 4) before bulk archive migratio...
+  - id: F-165
+    name: spec emitter YAML safety — block-scalar for multi-line free text
+    type: fix
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - skill_feature_author
+      - skill_spec_conversion
+      - spec_validate
+    test_strategy: smoke
+    digest: logcat-on ISSUES-LOG return (2026-05-13). When the feature-author or
+      spec-conversion skill emits YAML directly via th...
+  - id: F-166
+    name: title length validator — soft warning for feature names over 80 chars
+    type: fix
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - spec_validate
+    test_strategy: tdd
+    digest: logcat-on ISSUES-LOG return (2026-05-13). Feature `name:` values have
+      grown to 200-300 characters in some projects —...
+  - id: F-167
+    name: LLM author attribution on evidence
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - work_command
+      - state_transitioner
+      - dashboard
+      - metrics
+    test_strategy: tdd
+    digest: Tier 1 — distinguishes "machine self-evaluation" from "human
+      verification" inside the Iron Law evidence ledger. Today...
+  - id: F-168
+    name: AC ↔ Test traceability detector
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - check_command
+      - drift_detector
+      - spec_schema
+    test_strategy: tdd
+    digest: Tier 1 — 14th drift kind `AcceptanceTrace`. Maps every
+      `acceptance_criteria[]` entry to at least one concrete test fu...
+  - id: F-169
+    name: Content drift detector — CLAUDE.md sigil region SSoT check
+    type: feature
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - check_command
+      - drift_detector
+      - self_check
+    test_strategy: tdd
+    digest: Tier 1 — 15th drift kind `ContentDrift`. Validates the `<!--
+      harness:fact key=X value=V source=Y -->` sigil regions a...
+  - id: F-170
+    name: AcceptanceTrace message UX — surface missing test_ref name
+    type: fix
+    status: planned
+    release_target: v0.15.5
+    modules:
+      - check_command
+      - drift_detector
+    test_strategy: tdd
+    digest: "Empirical reproduction of F-167/F-168/F-169 caught a small UX bug in
+      the F-168 AcceptanceTrace detector: when an expl..."
+  - id: F-171
+    name: starter automation — init auto-routing + CLAUDE.md auto-copy
+    type: feature
+    status: planned
+    release_target: v0.15.6
+    modules:
+      - init_command
+      - cli_init
+      - skeleton
+      - scenario_idea
+    test_strategy: tdd
+    digest: 'Direct response to the user motive surfaced after the v0.15.5
+      multi-aspect verification: "모든 것은 사용자가 요청하는 것이 아니라, 내부적...'
+  - id: F-172
+    name: work cycle LLM token tracking — measurement infrastructure
+    type: feature
+    status: planned
+    release_target: v0.15.7
+    modules:
+      - cli_token
+      - token_log
+      - metrics
+      - dashboard
+    test_strategy: tdd
+    digest: Direct response to the v0.15.6 post-release verification gap. The user's
+      real question — "harness vs 그냥 Claude — 작업 퀄...
+  - id: F-173
+    name: SWE-bench Verified A/B benchmark suite — methodology + scripts + report
+      skeleton
+    type: docs
+    status: planned
+    release_target: v0.15.8
+    modules:
+      - docs_benchmark
+    test_strategy: smoke
+    digest: Direct response to "어떤 benchmark 로 객관 평가" — user picked SWE-bench
+      Verified 20-task subset (option A). This feature la...
+  - id: F-174
+    name: Stop-hook auto token capture — vanilla benchmark accuracy
+    type: feature
+    status: planned
+    release_target: v0.15.9
+    modules:
+      - hooks
+      - token_log
+      - cli_token
+    test_strategy: tdd
+    digest: 'F-172 follow-up. Surfaced when SWE-bench Verified framework (F-173)
+      landed but vanilla token measurement still depended on manual /cost typing.
+      A Stop-event hook parses the Claude Code transcript JSONL, extracts the
+      latest assistant message.usage, locates the active feature in
+      .harness/state.yaml, and invokes the existing `harness token` CLI to
+      append a typed llm_call event. Silent fail-open everywhere — no .harness
+      dir / no active feature / no usage in transcript → exit 0. Closes the
+      measurement-accuracy validity threat in
+      docs/benchmark/swe-bench-verified/analysis/threats-to-validity.md.'
+  - id: F-175
+    name: F-174 audit follow-up — fast-path + opt-out + privacy doc
+    type: fix
+    status: planned
+    release_target: v0.15.9
+    modules:
+      - hooks
+      - docs
+    test_strategy: tdd
+    digest: 'Pre-merge audit of F-174 surfaced three real concerns: (1)
+      non-harness sessions paid ~148 ms per turn for the hook to discover
+      they had no .harness/, (2) no opt-out for users who do not want the
+      auto-capture, (3) the privacy and brittleness contract was buried in
+      the source comment. This follow-up adds an env-driven fast-path
+      (CLAUDE_PROJECT_DIR check before any node spawn — 148 ms → 3 ms),
+      honors HARNESS_DISABLE_TOKEN_HOOK=1 for a hard opt-out, and surfaces
+      both the privacy stance and the opt-out flag in README + CHANGELOG.
+      Locks both behaviors with 2 new parity cases (total 866).'
+  - id: F-176
+    name: SWE-bench tasks.json correction — replace 10 nonexistent task_ids
+    type: fix
+    status: planned
+    release_target: v0.15.10
+    modules:
+      - docs_benchmark
+    test_strategy: smoke
+    digest: 'When pilot prep started, validation against the actual
+      Verified dataset (500 rows from princeton-nlp/SWE-bench_Verified)
+      revealed that 10 of the 20 task_ids in tasks.json do not exist:
+      django-15347, sympy-20639, scikit-learn-13497, scikit-learn-25500,
+      matplotlib-23987, sphinx-10325, pytest-7220, pytest-11148,
+      flask-4045, and the entire pandas-dev/pandas repo (0 tasks in
+      Verified). Replaced each with the closest verified candidate per
+      repo + difficulty bucket, pandas slot reassigned to pylint
+      (second pylint task to preserve N=20 with real ids). All 20 ids
+      now verified to exist; tasks.json gains `base_commit_short` and
+      `verified_difficulty` columns for transparency. REPORT.md §2.1
+      table reflects new ids. threats-to-validity.md gains a note about
+      authorial-vs-real difficulty mapping. The pre-merge audit pattern
+      (F-175) caught this on the very next cycle — validates the
+      ISSUES-LOG return loop.'
+  - id: F-177
+    name: SWE-bench pilot N=1 + aggregate.py auto-write fix
+    type: feature
+    status: planned
+    release_target: v0.15.11
+    modules:
+      - docs_benchmark
+    test_strategy: smoke
+    digest: 'When the maintainer attempted "benchmark a/b 이어서 쭉 진행" in-session,
+      two real gaps surfaced: (1) aggregate.py claimed to update REPORT.md but the
+      sentinel-substitution code path was not implemented — it only printed a
+      warning and dumped tables to stdout, so even a real pilot run would have to
+      paste tables manually. (2) REPORT.md had no sentinel comments, so even if
+      the script worked, there was no anchor to substitute into. F-177 implements
+      the sentinel-aware write path (3 blocks: per-task / aggregate /
+      harness-signals), adds the matching sentinels to REPORT.md, and records the
+      first non-placeholder row from an in-session demo on psf__requests-2317
+      (clearly labelled as same-session contamination · logic-verified-not-test-verified
+      · N=1 demo, not a clean benchmark sample). The aggregate.py now writes
+      atomically and reports `updated <path> — N sentinel blocks rewritten` on
+      success or hard-errors when a sentinel is missing. Real measurement still
+      requires external Docker + per-task sessions; this cycle just ensures the
+      ledger can actually be filled when those runs happen.'
+goals: []
+constraints:
+  tech_stack:
+    language: typescript
+    runtime: node-20+
+    cli_framework: claude-code-plugin
+    yaml_lib: js-yaml or yaml
+    hash: sha-256 via node:crypto
+    test_runner: vitest
+  architectural:
+    - SSoT = spec.yaml (BR-002)
+    - 사고의 글 vs 실행의 글 스키마 분리(BR-001)
+    - Walking Skeleton 필수 + Gate 5 까지 통과(BR-003)
+    - "Transparency-by-Preamble: 모든 명령이 3줄 출력(BR-004)"
+    - "CQS: 진단 명령은 read-only(BR-012)"
+    - Fail-open hooks(BR-006)
+    - Canonical Hashing 3층 Merkle(BR-007)
+    - $include 깊이 1 고정(BR-008)
+  compliance: []
+  prototype_mode: false
+deliverable:
+  type: cli-plugin
+  platform: claude-code
+  entry_points:
+    - name: harness:init
+      kind: slash-command
+      command: /harness:init
+      health_check:
+        kind: post-invocation-probe
+        expects: 9 files scaffolded + Gate 5 pass
+    - name: harness:spec
+      kind: slash-command
+      command: /harness:spec
+    - name: harness:sync
+      kind: slash-command
+      command: /harness:sync
+    - name: harness:work
+      kind: slash-command
+      command: /harness:work
+    - name: harness:status
+      kind: slash-command
+      command: /harness:status
+    - name: harness:check
+      kind: slash-command
+      command: /harness:check
+    - name: harness:events
+      kind: slash-command
+      command: /harness:events
+    - name: harness:metrics
+      kind: slash-command
+      command: /harness:metrics
+open_questions:
+  - id: OQ-1
+    title: v2.3.7 에 metadata.extensions.* 네임스페이스 공식 승격 여부
+    source_ref: §13.1 + §5.1 de-facto precedent (metadata.conversion)
+    status: open
+    related_gaps:
+      - NEW-28
+      - NEW-29
+      - NEW-30
+      - NEW-31
+      - NEW-32
+      - NEW-33
+      - NEW-34
+      - NEW-35
+      - NEW-36
+    proposed_resolution: v2.3.8-rfc 에서 additionalProperties 허용 + metadata.extensions 하위 화이트리스트 명시
+  - id: OQ-2
+    title: project.domain 에 'cli-plugin' 값 공식 수용 여부
+    source_ref: "§13.2 + §5.2 (현재 열거: web-service/worker/library)"
+    status: open
+    related_gaps:
+      - NEW-28
+    proposed_resolution: v2.3.8-rfc 에서 'cli-plugin' / 'editor-extension' /
+      'build-tool-plugin' 추가 + host_binding 필수화
+  - id: OQ-3
+    title: include_depth 정책 확장 — 깊이 2 이상 허용할지 혹은 간접 expand 허용할지
+    source_ref: §13.3 + §13.11 (L3212-3230)
+    status: open
+    related_gaps:
+      - G-11
+    proposed_resolution: 현재 depth=1 유지. 2 이상은 cycle detection 부담 커서 v3 연기
+  - id: OQ-4
+    title: events.log 의 partitioning 정책 (size vs time)
+    source_ref: §13.4 + §5.6
+    status: open
+    related_gaps: []
+    proposed_resolution: 기본 size:10MB rotation. time-based 는 user override 로 지원
+  - id: OQ-5
+    title: plugin 업그레이드 시 .harness/state.yaml schema 마이그레이션 자동화 수준
+    source_ref: §13.5 + §12
+    status: open
+    related_gaps:
+      - NEW-32
+    proposed_resolution: migration-agent 가 edit-wins 으로 사용자 확인 후 수행
+  - id: OQ-6
+    title: Hook 정의의 JSON vs YAML 선택
+    source_ref: §13.6 + §5.7
+    status: open
+    related_gaps:
+      - NEW-36
+    proposed_resolution: Claude Code host 규격 따름 (.claude/hooks/*.json)
+  - id: OQ-7
+    title: Agent 권한 매트릭스를 사용자가 override 허용할지
+    source_ref: §13.7 + §6.3.1
+    status: open
+    related_gaps:
+      - NEW-29
+    proposed_resolution: 기본 deny 원칙 준수, allowlist override 만 허용 (prompt 단계 도입)
+  - id: OQ-8
+    title: meta 어댑터의 host_subtype 을 JetBrains / Chrome-extension 까지 확장
+    source_ref: §13.8 (self 언급) + meta.md OQ-8
+    status: open
+    related_gaps:
+      - NEW-35
+      - NEW-36
+    proposed_resolution: meta 어댑터 v0.3 에서 검증 샘플 추가 후 서브타입 분화
+  - id: OQ-9
+    title: canonical hash 의 encoding normalization (BOM · CRLF · unicode NFC)
+    source_ref: §13.9 + 부록 D (L3307-3470)
+    status: open
+    related_gaps: []
+    proposed_resolution: 현재 NFC + LF + no-BOM 강제. BOM 있으면 strip 후 hashing
+  - id: OQ-10
+    title: plugin registry 에의 배포 규약 (namespace / visibility / signing)
+    source_ref: §13.10 + §11
+    status: open
+    related_gaps:
+      - NEW-35
+    proposed_resolution: Anthropic plugin registry 공식화 대기 — 확정 시 host_binding.registry 필드 값 표준화
+  - id: OQ-11
+    title: $include 로 로드되는 md 의 인코딩 검증 (BR-008 과 함께)
+    source_ref: §13.11 (L3212-3230)
+    status: open
+    related_gaps:
+      - G-11
+    proposed_resolution: UTF-8 + LF 강제. 위반 시 Gate 1 실패
+metadata:
+  source:
+    origin: architecture_doc
+    format: markdown
+    path: design/harness-boot-design-2.3.7.md
+    revision: v2.3.7
+    maturity: architecture
+    source_lines:
+      entities:
+        Spec: §5.1 (L394-617)
+        ExpandedSpec: §5.1 + §9.1 (L394, L2360)
+        Domain: §5.2 (L618-647)
+        Architecture: §5.3 (L705-808)
+        HarnessConfig: §5.4 (L809-933)
+        State: §5.5 (L934-1035)
+        Event: §5.6 (L1036-1094)
+        Hook: §5.7 (L1095-1147)
+        Protocol: §5.8 (L1148-1178)
+        Feature: §5.5 + §7.3.4
+        Command: §7.2-7.3 (L1415-2126)
+        Agent: §6.3 (L1221-1336)
+        Skill: §6.4 (L1337-1351)
+        Include: §5.1 + §13.11
+        Drift: §10.4 (L2498-2513)
+        Gate: §7.3.3 + §2.3
+        Preamble: §7.6 (L2193-2241)
+        HashTree: 부록 D (L3307-3470)
+      features:
+        F-001_init: §7.3.1 (L1444-1497)
+        F-002_spec: §7.3.2 (L1498-1577)
+        F-003_sync: §7.3.3 (L1578-1815)
+        F-004_work: §7.3.4 (L1816-1881)
+        F-005_status: §7.3.8 (L2043-2126)
+        F-006_check: §7.3.5 (L1882-1979)
+        F-007_events: §7.3.6 (L1980-2006)
+        F-008_metrics: §7.3.7 (L2007-2042)
+        F-009_include_expander: §5.1 + §7.3.3 + §13.11
+        F-010_canonical_hash: 부록 D 전체
+        F-011_preamble: §7.6
+        F-012_agents: §6.3 + §6.3.1
+        F-013_skills: §6.4
+        F-014_hooks: §5.7
+        F-015_claude_md_shim: §6.5 + §11.3
+        F-016_gate_chain_runner: §9 + §7.3.3 (L1578-1815)
+        F-017_state_yaml_io: §5.5 (L934-1035)
+        F-018_edit_wins: §10.4 (L2498-2513)
+        F-019_migration: §12
+        F-020_plugin_install_probe: §11 + §7.3.1 (L1444-1497)
+        F-021_hash_cache_gc: 부록 D (L3307-3470)
+      business_rules:
+        BR-001_thought_vs_execution: §2.1
+        BR-002_spec_as_ssot: §2.2 + §5.1
+        BR-003_walking_skeleton_gate5: §2.3 + §7.3.3
+        BR-004_preamble: §2.3 + §7.6 + v2.3.1 changelog
+        BR-005_entity_schema_strict: §5.1 + §5.4
+        BR-006_gate_blocking_chain: §9 + §2.3
+        BR-007_canonical_hashing: 부록 D
+        BR-008_include_depth_1: §13.11
+        BR-009_claude_md_shim: §11.3 + §12
+        BR-010_edit_wins: §10.4 (L2498-2513)
+        BR-011_tool_permission_matrix: §6.3.1
+        BR-012_preamble_stdout_only: §7.6
+        BR-013_append_only_events_log: §5.6 + §7.3.6
+        BR-014_hash_tree_determinism: 부록 D
+  conversion:
+    skill: spec-conversion
+    skill_version: "0.4"
+    sample_index: 6
+    re_conversion_round: 2
+    converted_at: 2026-04-22
+    domain_adapter: meta
+    adapter_version_used: "0.2"
+    host_subtype: self-bootstrap
+    notes_file: design/samples/harness-boot-self/v2/conversion-notes-v2.md
+    gaps_file: design/samples/harness-boot-self/v2/unrepresentable-v2.md
+    prior_spec_ref: design/samples/harness-boot-self/spec.yaml
+    v2_delta_file: design/samples/harness-boot-self/v2/conversion-notes-v2.md#§3
+    self_reference_flag: true
+    backlink_quality_star3_plus_v1: 65%
+    backlink_quality_star3_plus_v2_target: ≥90%
+  extensions:
+    agent_permissions:
+      matrix_source: §6.3.1 (L1260-1336)
+      schema: agent_id × tool_kind → allow|deny|prompt
+      agents:
+        - id: spec-author
+          allow:
+            - Read
+            - Write
+            - Edit
+            - Grep
+          deny:
+            - Bash
+            - WebFetch
+          prompt:
+            - Glob
+          rationale: 스펙 작성은 파일 조작만, 네트워크/쉘 차단
+        - id: skeleton-builder
+          allow:
+            - Read
+            - Write
+            - Edit
+            - Bash
+            - Glob
+          deny:
+            - WebFetch
+          prompt: []
+          rationale: Walking Skeleton 생성 — 빌드 실행 필요 but 네트워크 차단
+        - id: feature-worker
+          allow:
+            - Read
+            - Write
+            - Edit
+            - Grep
+            - Glob
+            - Bash
+          deny: []
+          prompt:
+            - WebFetch
+          rationale: 피처 구현 — 참조 문서 조회는 사용자 승인 후
+        - id: gate-auditor
+          allow:
+            - Read
+            - Bash
+            - Grep
+            - Glob
+          deny:
+            - Write
+            - Edit
+            - WebFetch
+          prompt: []
+          rationale: Gate 통과 여부만 판정 — 변경 권한 없음
+        - id: drift-detector
+          allow:
+            - Read
+            - Grep
+            - Glob
+          deny:
+            - Write
+            - Edit
+            - Bash
+            - WebFetch
+          prompt: []
+          rationale: drift 탐지 read-only
+        - id: hash-calculator
+          allow:
+            - Read
+            - Bash
+          deny:
+            - Write
+            - Edit
+            - WebFetch
+            - Grep
+            - Glob
+          prompt: []
+          rationale: canonical hashing — bash stat 만 사용
+        - id: include-expander
+          allow:
+            - Read
+          deny:
+            - Write
+            - Edit
+            - Bash
+            - WebFetch
+          prompt: []
+          rationale: 깊이 1 include 전개 — read-only
+        - id: preamble-printer
+          allow: []
+          deny:
+            - Read
+            - Write
+            - Edit
+            - Bash
+            - WebFetch
+            - Grep
+            - Glob
+          prompt: []
+          rationale: stdout 3-line preamble 만 — 도구 사용 안 함
+        - id: migration-agent
+          allow:
+            - Read
+            - Write
+            - Edit
+            - Bash
+          deny:
+            - WebFetch
+          prompt: []
+          rationale: v1→v2 마이그레이션 — 파일 조작 전권
+        - id: event-logger
+          allow:
+            - Read
+            - Write
+          deny:
+            - Edit
+            - Bash
+            - WebFetch
+            - Grep
+            - Glob
+          prompt: []
+          rationale: append-only 로그 기록만
+        - id: metrics-reporter
+          allow:
+            - Read
+          deny:
+            - Write
+            - Edit
+            - Bash
+            - WebFetch
+          prompt: []
+          rationale: events.log 읽기 read-only
+        - id: status-reporter
+          allow:
+            - Read
+          deny:
+            - Write
+            - Edit
+            - Bash
+            - WebFetch
+          prompt: []
+          rationale: state.yaml 읽기 read-only
+  changelog:
+    - version: 2.0.0
+      date: 2025-08-xx
+      note: 초기 공개 스키마 (design doc 초안)
+    - version: 2.3.0
+      date: 2026-01-xx
+      note: Hook 섹션 분리, Command schema 확정
+    - version: 2.3.1
+      date: 2026-02-xx
+      note: preamble_contract 필수화 (BR-004)
+    - version: 2.3.5
+      date: 2026-03-xx
+      note: canonical hashing (부록 D) 정식화
+    - version: 2.3.7
+      date: 2026-04-xx
+      note: include_depth=1 명시, migration (§12) 절 추가
+    - version: 2.3.8-rfc
+      date: pending
+      note: metadata.extensions.* 네임스페이스 공식화 + NEW-28~36 일부 승격 후보 (OQ-1/OQ-10)
+  changelog_source_ref: 부록 C 전체 (L3256-3306)
+  command_map:
+    - id: harness.init
+      command: /harness:init
+      handler: F-001_init
+      source_ref: §7.3.1 (L1444-1497)
+      preamble_required: true
+      gate: 0
+      requires_state: false
+    - id: harness.spec
+      command: /harness:spec
+      handler: F-002_spec
+      source_ref: §7.3.2 (L1498-1577)
+      preamble_required: true
+      gate: 0
+      requires_state: true
+    - id: harness.sync
+      command: /harness:sync
+      handler: F-003_sync
+      source_ref: §7.3.3 (L1578-1815)
+      preamble_required: true
+      gate: 5
+      requires_state: true
+    - id: harness.work
+      command: /harness:work
+      handler: F-004_work
+      source_ref: §7.3.4 (L1816-1881)
+      preamble_required: true
+      gate: 5
+      requires_state: true
+    - id: harness.check
+      command: /harness:check
+      handler: F-006_check
+      source_ref: §7.3.5 (L1882-1979)
+      preamble_required: true
+      gate: 3
+      requires_state: true
+    - id: harness.events
+      command: /harness:events
+      handler: F-007_events
+      source_ref: §7.3.6 (L1980-2006)
+      preamble_required: false
+      gate: 0
+      requires_state: true
+    - id: harness.metrics
+      command: /harness:metrics
+      handler: F-008_metrics
+      source_ref: §7.3.7 (L2007-2042)
+      preamble_required: false
+      gate: 0
+      requires_state: true
+    - id: harness.status
+      command: /harness:status
+      handler: F-005_status
+      source_ref: §7.3.8 (L2043-2126)
+      preamble_required: false
+      gate: 0
+      requires_state: true
+  ambient_files:
+    - path: .harness/spec.yaml
+      kind: ssot
+      owner: user
+      created_by: F-001_init
+      required: true
+      source_ref: §5.1 + §2.2
+    - path: .harness/state.yaml
+      kind: state
+      owner: plugin
+      created_by: F-003_sync
+      required: true
+      source_ref: §5.5 (L934-1035)
+    - path: .harness/events.log
+      kind: append_only_log
+      owner: plugin
+      created_by: F-003_sync
+      required: true
+      rotation: size:10MB
+      source_ref: §5.6 + §7.3.6
+    - path: .harness/hashes/
+      kind: hash_cache
+      owner: plugin
+      created_by: F-010_canonical_hash
+      required: false
+      source_ref: 부록 D (L3307-3470)
+    - path: .harness/includes/
+      kind: expanded_cache
+      owner: plugin
+      created_by: F-009_include_expander
+      required: false
+      source_ref: §5.1 + §13.11
+    - path: CLAUDE.md
+      kind: shim
+      owner: plugin
+      created_by: F-015_claude_md_shim
+      required: true
+      lifecycle: regenerated-on-plugin-upgrade
+      source_ref: §6.5 + §11.3
+    - path: .claude/agents/*.md
+      kind: agent_definitions
+      owner: plugin
+      created_by: F-012_agents
+      required: true
+      source_ref: §6.3 (L1221-1336)
+    - path: .claude/skills/*/SKILL.md
+      kind: skill_definitions
+      owner: plugin
+      created_by: F-013_skills
+      required: false
+      source_ref: §6.4 (L1337-1351)
+    - path: .claude/hooks/*.json
+      kind: hook_definitions
+      owner: plugin
+      created_by: F-014_hooks
+      required: false
+      source_ref: §5.7 (L1095-1147)
+  host_binding:
+    - host: claude-code
+      version_range: ">=0.7.0"
+      activation_events:
+        - onCommand:/harness:init
+        - onCommand:/harness:spec
+        - onCommand:/harness:sync
+        - onCommand:/harness:work
+        - onCommand:/harness:check
+        - onCommand:/harness:events
+        - onCommand:/harness:metrics
+        - onCommand:/harness:status
+        - onFileSystem:./.harness/spec.yaml
+      surface:
+        type: cli-plugin
+        registry: claude-code-plugin-registry
+      best_effort_forks:
+        - host: claude-code
+          version_range: <0.7.0
+          note: flag `--plugin` 미지원 — CLAUDE.md shim 만 작동 (F-015)
+        - host: cursor
+          version_range: "*"
+          note: slash-command 규약 다름 — 수동 설치로 F-004/F-006 만 사용 가능
+  drift_catalog:
+    - kind: spec_feature_code_missing
+      detect_by: F-006_check
+      severity: high
+      action: user_decision (add|remove_from_spec)
+    - kind: spec_feature_code_present_but_stale
+      detect_by: F-006_check
+      severity: medium
+      action: prompt_resolve
+    - kind: entity_yaml_code_schema_mismatch
+      detect_by: F-006_check
+      severity: high
+      action: block_until_resolved
+    - kind: include_file_missing
+      detect_by: F-009_include_expander
+      severity: high
+      action: abort_expansion
+    - kind: include_depth_violation
+      detect_by: F-009_include_expander
+      severity: high
+      action: abort_expansion
+    - kind: hash_tree_mismatch
+      detect_by: F-010_canonical_hash
+      severity: medium
+      action: regenerate_cache
+    - kind: state_log_desync
+      detect_by: F-003_sync
+      severity: low
+      action: auto_recover_from_log
+    - kind: edit_wins_override
+      detect_by: F-018_edit_wins
+      severity: info
+      action: record_and_preserve
+  versioning_axes:
+    - axis: spec_schema
+      current: 2.3.8
+      policy: semver_strict
+      migration_source_ref: §12
+    - axis: plugin_release
+      current: 0.1.1
+      policy: semver_with_pre
+      coupling_with_spec: minor_of_plugin_tracks_minor_of_spec
+    - axis: project_state
+      current: per-user .harness/state.yaml
+      policy: append_only_events_log
+      coupling_with_spec: state.yaml 의 spec_hash 와 spec.yaml 의 hash 가 일치 시 sync
+  contribution_points:
+    - kind: command
+      ref: extensions.command_map[*]
+      source_ref: §7.2 (L1415-1443)
+    - kind: activationEvent
+      values:
+        - onCommand:/harness:*
+        - onFileSystem:./.harness/spec.yaml
+      source_ref: §7.2.3 + §7.3.1
+    - kind: configuration
+      id: harness-boot.defaults
+      scope: .harness/spec.yaml
+      note: host 구성보다는 SSoT(spec.yaml) 내부에 저장 — self 특화
+      source_ref: §5.4 HarnessConfig (L809-933)
+  preamble_contract:
+    required: true
+    format: 3-line
+    line_1: ▶ {command} · {decision}
+    line_2: ⚙ gate={gate_id}/{gate_name} · state_hash={short_hash}
+    line_3: → {next_action_or_result}
+    encoding: utf-8
+    stderr_allowed: false
+    source_ref: §7.6 (L2193-2241)
+  gate_chain:
+    - id: 0
+      name: spec_exists
+      description: spec.yaml 존재 및 version/project 최소 키 채움
+      prerequisite: []
+      blocking: true
+      source_ref: §9 + §7.3.1
+    - id: 1
+      name: schema_valid
+      description: v2.3.7 스키마에 대해 구조 검증 통과
+      prerequisite:
+        - 0
+      blocking: true
+      source_ref: §9 + §5.1
+    - id: 2
+      name: domain_selected
+      description: domain 값이 확정 (web-service/worker/library/cli-plugin)
+      prerequisite:
+        - 1
+      blocking: true
+      source_ref: §5.2
+    - id: 3
+      name: features_coherent
+      description: features[] 간 의존성 DAG + F-000 skeleton 1회
+      prerequisite:
+        - 2
+      blocking: true
+      source_ref: §7.3.5 (L1882-1979)
+    - id: 4
+      name: skeleton_builds
+      description: Walking Skeleton 컴파일/타입체크 통과
+      prerequisite:
+        - 3
+      blocking: true
+      source_ref: §7.3.3 + §2.3
+    - id: 5
+      name: runtime_smoke
+      description: 엔트리포인트 1회 실행 후 preamble 1회 이상 출력
+      prerequisite:
+        - 4
+      blocking: true
+      source_ref: §7.3.3 + §7.6
+  release_plan:
+    v0.1:
+      shipped: true
+      shipped_at: 2026-04-23
+      tag: v0.1.1
+      scope: Walking Skeleton — /harness:init 만. plan.md → spec.yaml 변환 스킬은 v0.5.
+      features:
+        - F-001
+    v0.2:
+      shipped: partial
+      in_progress_at: 2026-04-23
+      target: Self-describe round trip — /harness:sync 로 spec → domain.md ·
+        architecture.yaml 파생 가능.
+      rationale: v0.1.x 는 빈 spec.yaml 을 만들 뿐. v0.2 는 채워진 spec 이 실제 파생물을 생성하도록 해서,
+        harness-boot-self 스펙으로 첫 dogfood 검증을 가능하게 함.
+      features:
+        - F-003
+        - F-009
+        - F-010
+        - F-011
+        - F-002
+      implementation_artifacts:
+        - scripts/canonical_hash.py + tests/unit/test_canonical_hash.py (19
+          tests)
+        - scripts/include_expander.py + tests/unit/test_include_expander.py (23
+          tests)
+        - scripts/plugin_root.py + tests/unit/test_plugin_root.py (14 tests)
+        - scripts/render_domain.py + tests/unit/test_render_domain.py (18 tests)
+        - scripts/render_architecture.py +
+          tests/unit/test_render_architecture.py (16 tests)
+        - scripts/sync.py + tests/unit/test_sync.py (18 tests · validation 통합 포함)
+        - scripts/validate_spec.py + tests/unit/test_validate_spec.py (8 tests ·
+          JSONSchema Gate 0~1)
+        - scripts/spec_mode_classifier.py +
+          tests/unit/test_spec_mode_classifier.py (14 tests · F-002 분류기)
+        - scripts/explain_spec.py + tests/unit/test_explain_spec.py (12 tests ·
+          F-002 Mode E · CQS)
+        - commands/sync.md (Phase 0 계약 + scripts/sync.py 위임)
+        - commands/spec.md (Mode A/B/R/E 계약 stub)
+      total_tests: 142
+      self_describe_smoke_ts: 2026-04-23T06:27:02Z
+      self_describe_smoke_spec_hash: 6971d901749783d29bfe35b06ffd77a48ead97207f268cc3a5719ad626d8849d
+    v0.3:
+      shipped: partial
+      shipped_at: 2026-04-23
+      target: Development loop closed — /harness:work + 조회/검증 명령.
+      rationale: v0.2 로 spec↔파생이 닫히면, 이제 피처 단위 TDD 루프를 자동화. 이 시점부터 harness-boot 자체가 별도
+        워크스페이스에서 harness-boot 으로 개발됨 (진짜 dogfood).
+      features:
+        - F-004
+        - F-005
+        - F-006
+        - F-007
+      implementation_artifacts:
+        - scripts/state.py + tests/unit/test_state.py (17 tests)
+        - scripts/work.py + tests/unit/test_work.py (17 tests)
+        - scripts/status.py + tests/unit/test_status.py (11 tests · CQS 검증)
+        - scripts/check.py + tests/unit/test_check.py (23 tests · 5/8 drift)
+        - scripts/events.py + tests/unit/test_events.py (12 tests · CQS 검증)
+        - commands/work.md · status.md · check.md · events.md
+      total_tests: 237
+    later:
+      shipped: false
+      target: 확장 인프라 — hooks 시스템 · 에이전트 · 스킬 · 마이그레이션.
+      features:
+        - F-008
+        - F-012
+        - F-013
+        - F-014
+        - F-015
+        - F-016
+        - F-017
+        - F-018
+        - F-019
+        - F-020
+        - F-021

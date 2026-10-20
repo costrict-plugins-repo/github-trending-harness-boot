@@ -1,0 +1,851 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harness-boot.dev/schemas/spec.schema.json",
+  "title": "harness-boot spec.yaml",
+  "description": "v2.3.9 — additive: introduces top-level `goals[]` (drive autonomous-loop containers, F-118) and `features[].goal_id` back-reference. Built on v2.3.8 which promoted the metadata.* blocks. Rationale: design/rfcs/v2.3.9-drive-goals.md",
+  "type": "object",
+
+  "$comment": "schema_version note: v2.3.9 is additive — every v2.3.8 spec still loads. goals[] and goal_id are optional. metadata.extensions.* is accepted for backward compatibility but deprecated (slated for removal in v2.5.0).",
+
+  "required": ["version", "project", "domain", "features"],
+
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+(\\.\\d+)?(-[A-Za-z0-9.-]+)?$",
+      "description": "Spec schema version (semver). The v2.3.9 loader accepts >=2.3.0."
+    },
+
+    "project": {
+      "type": "object",
+      "required": ["name", "summary"],
+      "properties": {
+        "name": {"type": "string"},
+        "summary": {"type": "string"},
+        "description": {"type": "string"},
+        "vision": {"type": "string"},
+        "mode": {
+          "type": "string",
+          "enum": ["prototype", "product"],
+          "description": "v0.9.6 — quality / ceremony tier switch. `prototype` lightens kickoff (1 bullet per agent), retro (machine sections only), design-review (skips autowire), and the Iron Law (1 declared evidence). `product` (the default when omitted) keeps the full strict path."
+        },
+        "language": {
+          "type": "string",
+          "enum": ["en", "ko", "auto"],
+          "description": "F-040 (v0.10.14) — preferred language for user-facing plugin output (work activate / dashboard / error messages). 'en' is the default and protects English adopters; 'ko' targets Korean users; 'auto' falls through to the system locale. Overridden by the HARNESS_LANG env var. Backend (code, schema, commit messages) stays English regardless."
+        },
+        "stakeholders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {
+              "role": {"type": "string"},
+              "count": {"type": ["integer", "string"]},
+              "interest": {"type": "string"}
+            }
+          }
+        },
+        "brief": {
+          "type": "object",
+          "description": "v0.5 additive — anchor for researcher / product-planner output. The normalized snapshot of brief.md derived from a one-line idea.",
+          "properties": {
+            "origin": {
+              "type": "string",
+              "enum": ["researcher", "plan.md", "manual"]
+            },
+            "input_sentence": {"type": "string"},
+            "assumptions": {
+              "type": "array",
+              "items": {"type": "object"}
+            },
+            "open_questions": {
+              "type": "array",
+              "items": {"type": "object"}
+            },
+            "competitors_studied": {
+              "type": "array",
+              "items": {"type": "object"}
+            },
+            "confidence_overall": {
+              "type": "string",
+              "enum": ["high", "medium", "low"]
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "domain": {
+      "type": "object",
+      "properties": {
+        "overview": {"type": "string"},
+        "entities": {
+          "type": "array",
+          "items": {"type": "object"}
+        },
+        "business_rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": {"type": "string", "pattern": "^BR-\\d+$"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "vocabulary": {"type": ["array", "object"]}
+      },
+      "additionalProperties": true
+    },
+
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^F-\\d+$"},
+          "name": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "F-130 — short human-readable label. Hard-capped at 100 characters so the dashboard layout, kickoff template, and inbox listings stay readable. Long context belongs in `description`, not the name."
+          },
+          "type": {"type": "string"},
+          "ui_surface": {
+            "type": "object",
+            "description": "v0.5 additive — UI surface declaration. The orchestrator uses this as the routing key for the ux-architect → visual-designer (+audio-designer) → a11y-auditor → frontend-engineer chain.",
+            "properties": {
+              "present": {"type": "boolean"},
+              "platforms": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "description": "Open string: web / mobile-ios / mobile-android / desktop / game / tui / etc."
+                }
+              },
+              "has_audio": {"type": "boolean", "default": false}
+            },
+            "additionalProperties": true
+          },
+          "performance_budget": {
+            "type": "object",
+            "description": "v0.6 additive — per-feature performance budget. Used as the routing key for performance-engineer.",
+            "properties": {
+              "lcp_ms": {"type": "integer", "minimum": 0, "description": "Largest Contentful Paint (Web Vitals)"},
+              "inp_ms": {"type": "integer", "minimum": 0, "description": "Interaction to Next Paint"},
+              "cls": {"type": "number", "minimum": 0, "description": "Cumulative Layout Shift"},
+              "bundle_kb": {"type": "integer", "minimum": 0, "description": "Bundle size budget (gzip KB)"},
+              "latency_p95_ms": {"type": "integer", "minimum": 0, "description": "Backend latency p95"},
+              "memory_rss_mb": {"type": "integer", "minimum": 0, "description": "Memory ceiling"},
+              "custom": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["metric", "budget"],
+                  "properties": {
+                    "metric": {"type": "string"},
+                    "budget": {"type": ["number", "string"]}
+                  },
+                  "additionalProperties": true
+                }
+              }
+            },
+            "additionalProperties": true
+          },
+          "supersedes": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^F-\\d+$"},
+            "description": "v0.10 additive — the ids of earlier features this one replaces. The replaced features are encouraged to transition to status=archived in state.yaml. Self-reference and cycles are forbidden (validated by check.py Anchor drift)."
+          },
+          "superseded_by": {
+            "type": "string",
+            "pattern": "^F-\\d+$",
+            "description": "v0.10 additive — the id of the feature that replaced this one (when present). `work.py --archive --superseded-by` fills it in as the inverse of supersedes."
+          },
+          "integration_anchor": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "v0.10.1 additive — anchor declaring that, while this feature is alive (status=done), the import / reference of its modules[].source must be visible from these entry-point files. check.py's AnchorIntegration drift validates it. Catches the integration gap that a per-feature smoke alone misses (e.g. every feature's gates pass, but the main entry point is empty so end-to-end doesn't actually run). Paths are relative to project_root."
+          },
+          "area": {
+            "type": "string",
+            "description": "v0.10.6 additive — domain / area key the feature belongs to (e.g. 'auth', 'billing', 'gate', 'observability'). Will be used to group spec/features/<area>/F-N.yaml when sharding becomes necessary. For now it is documentation-only — users can fill it freely, no enum is enforced."
+          },
+          "archived_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "v0.10.6 additive (declarative; clarified in v0.10.7) — the timestamp at which the feature was moved from the active spec into archive (ISO8601 UTC, e.g. '2026-04-27T00:00:00Z'). **Declarative — the user fills this into spec.yaml; work.py does not auto-fill it.** Runtime status is owned by state.yaml's status=archived (which work.py --archive does update). This field is for the future ~300-feature threshold (when entries move to spec/archive/YYYY.yaml) and for declaring archive intent at the spec level. When unset, the feature is active."
+          },
+          "archive_reason": {
+            "type": "string",
+            "description": "v0.10.6 additive (declarative; clarified in v0.10.7) — archive reason (1-2 lines). Filled by the user into spec.yaml alongside archived_at. The --reason option of work.py --archive is recorded only into events.log; it does not touch spec.yaml (that is the user's commit). Examples: 'feature complete · 6 mo unreferenced', 'replaced by external library', 'scope removed'."
+          },
+          "digest": {
+            "type": "string",
+            "description": "v0.10.6 additive — a 1-2 line LLM-context summary of the feature. When spec.yaml grows too large for a wholesale @import, the summary index (produced by scripts/spec/summary.py) extracts only this field. Falls back to `name` when unset."
+          },
+          "area_scan": {
+            "type": "object",
+            "description": "F-037 additive — per-feature override knob for fog-clear. Allows freezing chapters or pinning the resolved area set for that feature.",
+            "properties": {
+              "areas":  {"type": "array", "items": {"type": "string"}},
+              "freeze": {"type": "boolean", "default": false}
+            },
+            "additionalProperties": true
+          },
+          "include_path": {
+            "type": "string",
+            "description": "v0.10.6 additive — entry point for sharding. When set, this feature's detail is loaded from an external file (e.g. 'spec/features/auth/F-042.yaml'). Currently ignorable (forward-compat); activates around the ~1000-feature threshold."
+          },
+          "goal_id": {
+            "type": "string",
+            "pattern": "^G-\\d+$",
+            "description": "v2.3.9 additive (F-118 / drive) — back-reference to the Goal that this feature was scaffolded under. Optional; legacy features without a goal stay valid. The forward index is goals[].feature_ids; this is the inverse for fast feature → goal lookup."
+          }
+        },
+        "additionalProperties": true
+      },
+      "prefixItems": [
+        {
+          "description": "Walking Skeleton (v2.3 Runtime-Verified First) — features[0] must have type='skeleton'. The first feature has to carry an end-to-end execution skeleton that passes through gate_5; subsequent features ride on top of it. The 100-char `name` cap (F-130) applies here too — Walking Skeleton entries get the same readability rules.",
+          "type": "object",
+          "required": ["id", "type"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^F-\\d+$"},
+            "name": {"type": "string", "maxLength": 100},
+            "type": {"const": "skeleton"}
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+
+    "goals": {
+      "type": "array",
+      "description": "v2.3.9 additive (F-118 / drive) — autonomous-loop Goal containers. Each Goal groups N features under one user-supplied natural-language objective. Created by /harness-boot:drive (Stage 2 / F-119) but the schema lands in Stage 1 so dogfood manual goal-grouping is possible. Empty array on legacy specs.",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "feature_ids"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^G-\\d+$",
+            "description": "Goal identifier — G-NNN, monotonically allocated. Collision detection is GoalStore's responsibility."
+          },
+          "slug": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$",
+            "description": "URL-safe lowercase slug derived from `title`. Used for _workspace/drive/goals/<slug>/ paths. Korean and other non-ASCII titles are romanized or hash-fallback."
+          },
+          "title": {
+            "type": "string",
+            "description": "User-supplied natural-language objective. Verbatim — Korean is fine."
+          },
+          "description": {
+            "type": "string",
+            "description": "1-paragraph summary refined by researcher / product-planner. Optional on stage 1 (manual entry); auto-filled by Phase A in stage 2."
+          },
+          "feature_ids": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^F-\\d+$"},
+            "description": "Forward index — features that compose this goal. Each referenced feature should also carry `goal_id: G-NNN` (mirror) but missing back-references are warnings, not errors."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO8601 UTC timestamp."
+          },
+          "archived_at": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "ISO8601 UTC timestamp when the Goal was archived. Null on active goals."
+          },
+          "archive_reason": {
+            "type": ["string", "null"],
+            "description": "1-2 line archive reason. Null on active goals."
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "constraints": {
+      "type": "object",
+      "description": "v0.6 structuring — definitions for tech_stack subfields. Other constraints stay free-form via additionalProperties.",
+      "properties": {
+        "tech_stack": {
+          "type": "object",
+          "description": "v0.6 additive — structured runtime / language / test / build declarations. Consumed by the gate runner's pre-flight check.",
+          "properties": {
+            "runtime": {
+              "type": "string",
+              "description": "node | python | browser | deno | bun | ..."
+            },
+            "min_version": {
+              "type": "string",
+              "description": "semver or major version (e.g. '20', '3.11')"
+            },
+            "language": {
+              "type": "string",
+              "description": "javascript | typescript | python | go | rust | ..."
+            },
+            "test": {
+              "type": "string",
+              "description": "node:test | pytest | vitest | jest | ..."
+            },
+            "build": {
+              "type": "string",
+              "description": "none | vite | webpack | rollup | esbuild | setuptools | ..."
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "decisions": {
+      "type": "array",
+      "description": "v0.6 additive — Architecture Decision Records. The product-planner writes them into plan.md, Mode B-2 converts them here, and render_domain.py renders them into domain.md's ## Decisions section.",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "decision"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^ADR-\\d+$",
+            "description": "ADR-NNN"
+          },
+          "title": {"type": "string"},
+          "context": {"type": "string", "description": "Why this decision was needed — the background"},
+          "decision": {"type": "string", "description": "What was decided"},
+          "consequences": {"type": "string", "description": "Positive and negative outcomes of the decision"},
+          "status": {
+            "type": "string",
+            "enum": ["proposed", "accepted", "deprecated", "superseded"],
+            "default": "accepted"
+          },
+          "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Open string: security · auth · ui · brand · stack · perf · data · api · a11y · ci · deploy · etc."
+          },
+          "related_features": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^F-\\d+$"}
+          },
+          "supersedes": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^ADR-\\d+$"},
+            "description": "The ids of earlier ADRs this one replaces. The replaced ADRs auto-transition to status=superseded."
+          },
+          "superseded_by": {
+            "type": "string",
+            "pattern": "^ADR-\\d+$",
+            "description": "The id of the ADR that replaced this one (when present). Mode B-2 fills it in as the inverse of supersedes."
+          },
+          "source_ref": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "risks": {
+      "type": "array",
+      "description": "v0.6 additive — risk catalog. The product-planner writes it into plan.md and Mode B-2 converts. Direct input for qa-engineer's risk-based testing.",
+      "items": {
+        "type": "object",
+        "required": ["id", "statement", "likelihood", "impact"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(R|RISK)-\\d+$",
+            "description": "v0.10.7 (returned via cosmic-suika I-004): both R-N and RISK-N are accepted. The RISK- prefix was added for consistency with the other id conventions (BR-N · ADR-N · F-N · AC-N) — additive backward-compat, so existing R-N entries keep working."
+          },
+          "statement": {"type": "string"},
+          "likelihood": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
+          "impact": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
+          "mitigation": {"type": "string"},
+          "tags": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "related_features": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^F-\\d+$"}
+          },
+          "status": {
+            "type": "string",
+            "enum": ["open", "mitigated", "materialized", "closed"],
+            "default": "open"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "deliverable": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string"},
+        "platform": {"type": "string"},
+        "artifacts": {"type": "array"},
+        "entry_points": {"type": "array"},
+        "source": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^OQ-"}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "metadata": {
+      "type": "object",
+      "description": "v2.3.8 promotion — the eight blocks are now first-class metadata.* fields. metadata.extensions.* is accepted for backward compatibility (deprecated).",
+
+      "properties": {
+        "source": {
+          "type": "object",
+          "description": "Conversion provenance. Common shape: {origin, maturity, revision}. F-036 added 'existing_code' as an expected origin value (brownfield repo seed via /harness-boot:init option 3). Existing values 'idea' / 'planning_doc' / 'architecture_doc' / 'implementation' remain valid. additionalProperties: true is implicit — additive only.",
+          "additionalProperties": true
+        },
+        "traceability": {"type": "object"},
+        "conversion": {
+          "type": "object",
+          "properties": {
+            "re_conversion_round": {"type": "integer", "minimum": 1},
+            "adapter_version_used": {"type": "string"},
+            "host_subtype": {
+              "type": "string",
+              "enum": [
+                "self-bootstrap",
+                "host-plugin-build-tool",
+                "host-plugin-editor-extension",
+                "host-plugin-other",
+                "library",
+                "saas-service",
+                "worker",
+                "web-app",
+                "game",
+                "mixed"
+              ],
+              "description": "Subtype discriminator from meta adapter v0.2 §3.2 (intended for the meta domain initially — other domains use 'mixed' or omit)."
+            },
+            "prior_spec_ref": {"type": "string"},
+            "backlink_quality_star3_plus": {"type": "string"},
+            "backlink_quality_star3_plus_v2": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+
+        "style_fingerprint": {
+          "type": "object",
+          "description": "F-037 (Layer B fog-clear) — project-level style cache. Populated deterministically by scripts/scan/style_fingerprint.fingerprint() during work.activate. Read by scripts/ceremonies/kickoff.py to inject style context into the implementer prompt. All sub-fields optional and additive.",
+          "properties": {
+            "language":     {"type": "string"},
+            "formatter":    {"type": "string"},
+            "linter":       {"type": "string"},
+            "test_runner":  {"type": "string"},
+            "test_pattern": {"type": "string"},
+            "naming":       {"type": "object"},
+            "config_files": {"type": "array", "items": {"type": "string"}}
+          },
+          "additionalProperties": true
+        },
+        "area_index": {
+          "type": "array",
+          "description": "F-037 — registry of areas the fog-clear hook has reconnoitered. Canonical persistence is the .harness/area_index.yaml side file; this schema field is reserved for users who choose to inline the registry into spec.yaml. Each entry: slug, label, modules, paths, chapter_path, last_scanned_ts, first_seen_feature_id, _provenance.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "slug":                    {"type": "string"},
+              "label":                   {"type": "string"},
+              "modules":                 {"type": "array", "items": {"type": "string"}},
+              "paths":                   {"type": "array", "items": {"type": "string"}},
+              "chapter_path":            {"type": "string"},
+              "last_scanned_ts":         {"type": "string"},
+              "first_seen_feature_id":   {"type": "string", "pattern": "^F-\\d+$"},
+              "_provenance":             {"type": "object"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "fog": {
+          "type": "object",
+          "description": "F-037 — opt-out + bound knobs for fog-clear. disabled=true skips the autowire entirely. max_chapters caps the .harness/chapters/ growth (default 32). max_paths_per_area caps how many paths each chapter lists (default 16).",
+          "properties": {
+            "disabled":            {"type": "boolean", "default": false},
+            "max_chapters":        {"type": "integer", "minimum": 1, "default": 32},
+            "max_paths_per_area":  {"type": "integer", "minimum": 1, "default": 16}
+          },
+          "additionalProperties": true
+        },
+        "command_map": {
+          "$ref": "#/$defs/command_map"
+        },
+        "ambient_files": {
+          "$ref": "#/$defs/ambient_files"
+        },
+        "host_binding": {
+          "$ref": "#/$defs/host_binding"
+        },
+        "drift_catalog": {
+          "$ref": "#/$defs/drift_catalog"
+        },
+        "versioning_axes": {
+          "$ref": "#/$defs/versioning_axes"
+        },
+        "contribution_points": {
+          "$ref": "#/$defs/contribution_points"
+        },
+        "preamble_contract": {
+          "$ref": "#/$defs/preamble_contract"
+        },
+        "changelog": {
+          "$ref": "#/$defs/changelog"
+        },
+        "gate_chain": {
+          "$ref": "#/$defs/gate_chain"
+        },
+        "changelog_source_ref": {"type": "string"},
+
+        "extensions": {
+          "$comment": "v2.3.7 experimental namespace — deprecated in v2.3.8. The v2.3.8 loader promotes blocks found here into metadata.* and emits a warning. Slated for removal in v2.5.0.",
+          "type": "object",
+          "deprecated": true,
+          "properties": {
+            "command_map": {"$ref": "#/$defs/command_map"},
+            "ambient_files": {"$ref": "#/$defs/ambient_files"},
+            "host_binding": {"$ref": "#/$defs/host_binding"},
+            "drift_catalog": {"$ref": "#/$defs/drift_catalog"},
+            "versioning_axes": {"$ref": "#/$defs/versioning_axes"},
+            "contribution_points": {"$ref": "#/$defs/contribution_points"},
+            "preamble_contract": {"$ref": "#/$defs/preamble_contract"},
+            "changelog": {"$ref": "#/$defs/changelog"},
+            "gate_chain": {"$ref": "#/$defs/gate_chain"},
+            "agent_permissions": {
+              "$comment": "Slated for promotion in v2.4.0 — out of scope for v2.3.8. self v2 uses an object form ({matrix_source, schema, agents[]}); v2.4.0 will lift it into an array.",
+              "type": ["array", "object"]
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+
+  "additionalProperties": true,
+
+  "$defs": {
+    "command_map": {
+      "title": "command_map[] — explicit function-signature declarations for entry_points",
+      "description": "P0 MUST-if-present. 3/3 meta hits. Linked to features[].id via the handler reference.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "description": "Unique identifier — may equal the command string."},
+          "command": {"type": "string", "description": "The command string registered with the host."},
+          "handler": {
+            "type": "string",
+            "description": "Reference to features[].id (e.g. F-001) or any free-form feature identifier (e.g. F-001_init). /harness-boot:check verifies whether it matches an existing features[].id."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Permitted values vary by subtype: self-bootstrap (slash-command / build-step / contract-schema), build-tool (vite-subcommand / rollup-plugin / plugin-factory / webpack-plugin), editor-extension (vscode-command / jetbrains-action / sublime-command). Optional — when set, /harness-boot:check enforces the per-subtype values."
+          },
+          "source_ref": {"type": "string"},
+          "requires_opt_in": {"type": "boolean", "default": false},
+          "mode_axis": {
+            "type": "string",
+            "enum": ["read", "write", "side-effect-free", "mixed"]
+          },
+          "preamble_required": {"type": "boolean"},
+          "gate": {"type": "integer", "description": "Reference to gate_chain[].id"},
+          "requires_state": {"type": "boolean"}
+        },
+        "additionalProperties": true
+      },
+      "uniqueItems": false,
+      "$comment": "Duplicate ids are forbidden (programmatic check) — JSONSchema cannot express it. self-bootstrap connects to a feature via preamble_required / gate / requires_state instead of kind — kind is optional."
+    },
+
+    "ambient_files": {
+      "title": "ambient_files[] — workspace files the spec creates or reads",
+      "description": "P0 MUST-if-present. 3/3 meta hits. Globs are only allowed when required=false.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "kind"],
+        "properties": {
+          "path": {"type": "string", "description": "Relative path or glob"},
+          "kind": {
+            "type": "string",
+            "$comment": "Field-tested recommended values: ssot / cache / expanded_cache / hash_cache / index_cache / host_config / draft_buffer / lockfile / artifact / log / append_only_log / report / state / shim / agent_definitions / skill_definitions / hook_definitions / other. Diverse across subtypes — kept open-string."
+          },
+          "owner": {
+            "type": "string",
+            "enum": ["team", "user", "plugin", "host", "ci"]
+          },
+          "created_by": {
+            "type": "string",
+            "description": "Reference to features[].id, or 'user-manual' / 'host' / 'ci'"
+          },
+          "required": {"type": "boolean", "default": false},
+          "sensitive": {"type": "boolean", "default": false},
+          "write_policy": {
+            "type": "string",
+            "enum": ["edit-wins", "overwrite", "append-only", "immutable"]
+          },
+          "source_ref": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "host_binding": {
+      "title": "host_binding[] — version contract with the host program",
+      "description": "P0 SHOULD (conditional MUST for host-plugin subtypes). 2/2 host-plugin hits. N/A for self-bootstrap.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["host", "version_range"],
+        "properties": {
+          "host": {"type": "string", "description": "vite / vscode / rollup / esbuild / webpack / jetbrains / cursor / vscodium / ..."},
+          "version_range": {"type": "string", "description": "semver range"},
+          "activation_events": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "surface": {
+            "type": "object",
+            "properties": {
+              "type": {"type": "string"},
+              "registry": {"type": "string"}
+            },
+            "additionalProperties": true
+          },
+          "peer_contract": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {"type": "string", "enum": ["peerDependencies", "peerDependenciesMeta"]},
+                  "strict": {"type": "boolean"}
+                },
+                "additionalProperties": true
+              }
+            ]
+          },
+          "publisher_contract": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {"type": "string"},
+                  "engines_field": {"type": "string"}
+                },
+                "additionalProperties": true
+              }
+            ]
+          },
+          "best_effort_forks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["host"],
+              "properties": {
+                "host": {"type": "string"},
+                "version_range": {"type": "string"},
+                "note": {"type": "string"}
+              }
+            }
+          },
+          "type_imports": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "drift_catalog": {
+      "title": "drift_catalog[] — expected kinds of spec / reality drift and how to handle them",
+      "description": "P0 MUST-if-present. 3/3 meta hits.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "severity", "action"],
+        "properties": {
+          "kind": {"type": "string"},
+          "detect_by": {"type": "string", "description": "Reference to features[].id or 'check-time'"},
+          "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high", "critical"]
+          },
+          "action": {"type": "string"},
+          "source_ref": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "versioning_axes": {
+      "title": "versioning_axes[] — independently versioned axes",
+      "description": "P0 MUST-if-present. 3/3 meta hits. Each axis carries its own semver and policy.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["axis", "policy"],
+        "properties": {
+          "axis": {"type": "string"},
+          "current": {"type": "string"},
+          "policy": {
+            "type": "string",
+            "$comment": "Recommended values: semver_strict / semver_with_migration / semver_with_regenerate / semver_with_pre / stable_contract / append_only_events_log / calver / custom. Diverse by domain — kept open-string."
+          },
+          "migration_notes": {"type": "string"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"policy": {"const": "custom"}}},
+            "then": {"required": ["migration_notes"]}
+          }
+        ],
+        "additionalProperties": true
+      }
+    },
+
+    "contribution_points": {
+      "title": "contribution_points[] — UI / behavior surfaces contributed to the host",
+      "description": "P1 SHOULD. 3/3 meta hits. The accepted `kind` set differs by subtype — see meta adapter v0.2 §4.8 host matrix.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "$comment": "Per-subtype allowed values (meta adapter v0.2 §4.8): self-bootstrap = buildStep / contractSchema / slashCommand; build-tool = pluginHook / cliSubcommand / configSchema; editor-extension = command / keybinding / view / configuration / menus / statusbar / activationEvents / webview / language / debugger. Not closed by enum — kept open-string (subtype validation happens in /harness-boot:check)."
+          },
+          "ref": {"type": "string"},
+          "values": {"type": "array"},
+          "id": {"type": "string"},
+          "schema_ref": {"type": "string"},
+          "settings_count": {"type": "integer"},
+          "source_ref": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "preamble_contract": {
+      "title": "preamble_contract — contract for the text emitted at process start",
+      "description": "P1 MAY. 3/3 meta hits. required=true is typical for self-bootstrap; false is typical for host-plugins.",
+      "type": "object",
+      "properties": {
+        "required": {"type": "boolean"},
+        "format": {
+          "type": "string",
+          "enum": ["multi-line-banner", "single-line-banner", "statusbar-line", "no-output", "3-line", "2-line"],
+          "$comment": "self v2 uses '3-line' (a 3-row banner with line_1/2/3). Treat it as a special case of multi-line-banner — v2.3.9 may consolidate the format taxonomy."
+        },
+        "line_1": {"type": "string"},
+        "line_2": {"type": "string"},
+        "line_3": {"type": "string"},
+        "encoding": {"type": "string"},
+        "stderr_allowed": {"type": "boolean"},
+        "source_ref": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"required": {"const": true}}},
+          "then": {"required": ["format", "line_1"]}
+        }
+      ],
+      "additionalProperties": true
+    },
+
+    "changelog": {
+      "title": "changelog[] — spec-level change history",
+      "description": "P2 MAY. Consistent with P-24. 3/3 meta hits.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "$comment": "v0.10.7 (returned via cosmic-suika I-007): version is optional. Entries with only date · note are accepted — avoids forcing placeholder values.",
+        "required": [],
+        "properties": {
+          "version": {"type": "string"},
+          "date": {"type": "string"},
+          "note": {"type": "string"},
+          "deprecated_in": {
+            "type": "string",
+            "$comment": "v2.3.9 candidate — OQ-v238-1. Optional today."
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+
+    "gate_chain": {
+      "title": "gate_chain[] — CI/CD or runtime gate chain",
+      "description": "P1 MAY (conditional). 1/3 full (self-bootstrap), 2/3 partial (host-plugin folds it into drift_catalog.action). Two styles are accepted: (A) on_fail / blocks, (B) prerequisite / blocking — self v2 uses style B.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "integer"},
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "on_fail": {
+            "type": "string",
+            "enum": ["stop", "warn", "continue"]
+          },
+          "blocks": {
+            "type": "array",
+            "items": {"type": "integer"}
+          },
+          "prerequisite": {
+            "type": "array",
+            "items": {"type": ["integer", "string"]},
+            "description": "Style B — list of gate ids that must be satisfied before this gate runs."
+          },
+          "blocking": {
+            "type": "boolean",
+            "description": "Style B — when true, a failure halts subsequent gates (equivalent to on_fail=stop)."
+          },
+          "source_ref": {"type": "string"}
+        },
+        "anyOf": [
+          {"required": ["on_fail"]},
+          {"required": ["blocking"]},
+          {"required": ["prerequisite"]}
+        ],
+        "additionalProperties": true
+      }
+    }
+  }
+}

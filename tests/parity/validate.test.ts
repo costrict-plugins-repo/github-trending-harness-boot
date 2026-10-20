@@ -1,0 +1,273 @@
+/**
+ * Parity test for `src/spec/validate.ts` (F-089).
+ *
+ * Covers:
+ *
+ *   - Loading the canonical sample spec via TS and validating it
+ *     against the same JSONSchema Python uses — identical pass/fail
+ *     outcome.
+ *   - Negative inputs (top-level non-mapping, malformed YAML)
+ *     surface SpecValidationError with the expected `reason`.
+ *   - Schema-violation errors carry an `absolutePath`-shaped path.
+ *
+ * Run via `npm run test:parity`.
+ */
+
+import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {dirname, join} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {afterEach, beforeEach, describe, expect, it} from 'vitest';
+
+import {
+  SpecValidationError,
+  collectWarnings,
+  loadSpec,
+  validate,
+} from '../../src/spec/validate.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, '..', '..');
+const CANONICAL_SPEC = join(REPO_ROOT, 'docs', 'samples', 'harness-boot-self', 'spec.yaml');
+const SCHEMA_PATH = join(REPO_ROOT, 'docs', 'schemas', 'spec.schema.json');
+
+describe('spec validator — happy path', () => {
+  it('loadSpec parses the canonical sample without throwing', () => {
+    const data = loadSpec(CANONICAL_SPEC);
+    expect(typeof data).toBe('object');
+    expect(data).not.toBeNull();
+    expect(data['version']).toBeDefined();
+  });
+
+  it('validate succeeds against the canonical sample (parity with Python)', () => {
+    const data = loadSpec(CANONICAL_SPEC);
+    expect(() => validate(data, SCHEMA_PATH)).not.toThrow();
+  });
+
+  it('validate uses the default schema path when caller passes null', () => {
+    const data = loadSpec(CANONICAL_SPEC);
+    expect(() => validate(data, null)).not.toThrow();
+  });
+});
+
+describe('spec validator — top-level guards', () => {
+  let workDir: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), 'validate-'));
+  });
+  afterEach(() => {
+    rmSync(workDir, {recursive: true, force: true});
+  });
+
+  it('rejects an empty file (parses to null) with reason=top_level', () => {
+    const path = join(workDir, 'empty.yaml');
+    writeFileSync(path, '', 'utf-8');
+    try {
+      loadSpec(path);
+      expect.fail('expected loadSpec to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecValidationError);
+      expect((err as SpecValidationError).reason).toBe('top_level');
+    }
+  });
+
+  it('rejects a top-level scalar with reason=top_level', () => {
+    const path = join(workDir, 'scalar.yaml');
+    writeFileSync(path, '42\n', 'utf-8');
+    expect(() => loadSpec(path)).toThrow(SpecValidationError);
+  });
+
+  it('rejects a top-level array with reason=top_level', () => {
+    const path = join(workDir, 'array.yaml');
+    writeFileSync(path, '- one\n- two\n', 'utf-8');
+    expect(() => loadSpec(path)).toThrow(SpecValidationError);
+  });
+
+  it('rejects malformed YAML with reason=yaml_parse', () => {
+    const path = join(workDir, 'bad.yaml');
+    // Unmatched bracket — yaml parser must reject.
+    writeFileSync(path, 'key: [unclosed\n', 'utf-8');
+    try {
+      loadSpec(path);
+      expect.fail('expected loadSpec to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecValidationError);
+      expect((err as SpecValidationError).reason).toBe('yaml_parse');
+    }
+  });
+
+  it('rejects missing files with reason=read_error', () => {
+    const path = join(workDir, 'does-not-exist.yaml');
+    try {
+      loadSpec(path);
+      expect.fail('expected loadSpec to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecValidationError);
+      expect((err as SpecValidationError).reason).toBe('read_error');
+    }
+  });
+});
+
+describe('spec validator — schema violations', () => {
+  it('throws SpecValidationError with absolutePath-shaped path on violation', () => {
+    // Cherry-pick a minimal invalid spec — missing required `version`.
+    const invalid = {
+      schema_version: '2.3',
+      project: {name: 'x', mode: 'prototype'},
+    };
+    try {
+      validate(invalid, SCHEMA_PATH);
+      expect.fail('expected validate to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecValidationError);
+      expect((err as SpecValidationError).path).toBeInstanceOf(Array);
+      // ajv reports `required` as the keyword for missing-required errors.
+      expect((err as SpecValidationError).reason).toBeTruthy();
+    }
+  });
+
+  it('throws with reason=missing_schema_file when schema does not exist', () => {
+    try {
+      validate({}, '/nonexistent/schema.json');
+      expect.fail('expected validate to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecValidationError);
+      expect((err as SpecValidationError).reason).toBe('missing_schema_file');
+    }
+  });
+});
+
+describe('spec validator — feature name length cap (F-130)', () => {
+  function specWithFeatureName(name: string): Record<string, unknown> {
+    return {
+      version: '2.3',
+      schema_version: '2.3',
+      project: {name: 'len-test', summary: 'fixture for F-130', mode: 'prototype'},
+      domain: {one_liner: 'fixture'},
+      features: [
+        {
+          id: 'F-001',
+          name,
+          type: 'skeleton',
+        },
+      ],
+    };
+  }
+
+  it('accepts a feature name exactly 100 characters long', () => {
+    const name100 = 'a'.repeat(100);
+    expect(name100.length).toBe(100);
+    expect(() => validate(specWithFeatureName(name100), SCHEMA_PATH)).not.toThrow();
+  });
+
+  it('rejects a feature name 101 characters long with a path that names features/0/name', () => {
+    const name101 = 'a'.repeat(101);
+    expect(name101.length).toBe(101);
+    try {
+      validate(specWithFeatureName(name101), SCHEMA_PATH);
+      expect.fail('expected validate to throw on overlong feature name');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecValidationError);
+      const path = (err as SpecValidationError).path;
+      expect(path).toBeInstanceOf(Array);
+      // Path should contain a segment naming /features/0/name (Ajv style: /features/0/name).
+      const flat = (path as string[]).join(' ');
+      expect(flat).toContain('features');
+      expect(flat).toContain('name');
+    }
+  });
+});
+
+describe('spec validator — F-166 title length soft warning (≤ 80)', () => {
+  function specWithName(name: string): Record<string, unknown> {
+    return {
+      features: [{id: 'F-001', name, type: 'feature'}],
+    };
+  }
+
+  it('emits no warning when name is 80 chars (boundary)', () => {
+    const name80 = 'a'.repeat(80);
+    const warnings = collectWarnings(specWithName(name80));
+    const nameWarnings = warnings.filter((w) => w.code === 'feature.name_too_long');
+    expect(nameWarnings).toHaveLength(0);
+  });
+
+  it('emits a soft warning when name is 81 chars', () => {
+    const name81 = 'a'.repeat(81);
+    const warnings = collectWarnings(specWithName(name81));
+    const nameWarnings = warnings.filter((w) => w.code === 'feature.name_too_long');
+    expect(nameWarnings).toHaveLength(1);
+    const w = nameWarnings[0]!;
+    expect(w.path).toEqual(['features', 0, 'name']);
+    expect(w.message).toContain('81 chars');
+    expect(w.message).toMatch(/digest|description/);
+  });
+
+  it('counts unicode code points, not utf-16 units (emoji as 1)', () => {
+    // 79 ASCII + 1 emoji = 80 code points → no warning.
+    const name80cp = 'a'.repeat(79) + '🎯';
+    const warnings = collectWarnings(specWithName(name80cp));
+    const nameWarnings = warnings.filter((w) => w.code === 'feature.name_too_long');
+    expect(nameWarnings).toHaveLength(0);
+  });
+
+  it('validate() does not throw on overlong (≤100) names — warnings are non-blocking', () => {
+    // Hard cap (F-130) is 100; soft warn (F-166) is 80.
+    // A name between 81 and 100 must pass validate() and only show as a warning.
+    const name99 = 'a'.repeat(99);
+    const fullSpec = loadSpec(CANONICAL_SPEC);
+    (fullSpec['features'] as Array<Record<string, unknown>>).push({
+      id: 'F-9999',
+      name: name99,
+      type: 'feature',
+      status: 'planned',
+    });
+    expect(() => validate(fullSpec, SCHEMA_PATH)).not.toThrow();
+    const warnings = collectWarnings(fullSpec);
+    expect(warnings.some((w) => w.code === 'feature.name_too_long')).toBe(true);
+  });
+
+  it('returns [] on malformed input without throwing', () => {
+    expect(collectWarnings(null)).toEqual([]);
+    expect(collectWarnings('not a mapping')).toEqual([]);
+    expect(collectWarnings({features: 'not an array'})).toEqual([]);
+    expect(collectWarnings({features: [null, 42, 'bad']})).toEqual([]);
+  });
+});
+
+describe('spec validator — Python parity sanity', () => {
+  it('TS valid result matches Python valid result for the canonical spec', () => {
+    // Read the same spec from disk that Python uses.
+    const raw = readFileSync(CANONICAL_SPEC, 'utf-8');
+    expect(raw.length).toBeGreaterThan(0);
+    const parsed = loadSpec(CANONICAL_SPEC);
+    expect(() => validate(parsed, SCHEMA_PATH)).not.toThrow();
+    // The canonical spec has dozens of features — confirm we actually
+    // walked structure rather than short-circuiting.
+    expect(Array.isArray(parsed['features'])).toBe(true);
+    expect((parsed['features'] as unknown[]).length).toBeGreaterThan(10);
+  });
+});
+
+describe('starter spec template (F-121 / L-001)', () => {
+  // The template at docs/templates/starter/spec.yaml.template is the
+  // file `/harness-boot:init` writes into a fresh project. It must
+  // satisfy spec.schema.json so the very first `harness sync --soft`
+  // does not surface a SpecValidationError to the user.
+  const TEMPLATE_PATH = join(REPO_ROOT, 'docs', 'templates', 'starter', 'spec.yaml.template');
+
+  it('passes AJV validation against spec.schema.json', () => {
+    const parsed = loadSpec(TEMPLATE_PATH);
+    expect(() => validate(parsed, SCHEMA_PATH)).not.toThrow();
+  });
+
+  it('declares all schema-required project.* fields (regression guard)', () => {
+    const parsed = loadSpec(TEMPLATE_PATH);
+    const project = parsed['project'] as Record<string, unknown> | undefined;
+    expect(project).toBeDefined();
+    // Schema requires ["name", "summary"] — see docs/schemas/spec.schema.json.
+    expect(project).toHaveProperty('name');
+    expect(project).toHaveProperty('summary');
+  });
+});

@@ -1,0 +1,769 @@
+/**
+ * Drive Phase B — execute loop (v0.14.0 / F-119 — Stage 2).
+ *
+ * Reads the active drive checkpoint, picks the next-action via
+ * `intentPlanner.suggest()`, and executes one Suggestion per
+ * iteration. Halt detection runs **before** the planner so the
+ * structural guards (STOP file, wall-clock, iteration cap,
+ * working-tree commit boundary, blocked feature) can short-circuit a
+ * loop that would otherwise spin.
+ *
+ * @module drive/loop
+ */
+
+import {execFileSync} from 'node:child_process';
+import {appendFileSync, existsSync, readFileSync} from 'node:fs';
+import {dirname, join} from 'node:path';
+import {parse as yamlParse} from 'yaml';
+import {State, type Feature, type FeatureStatus} from '../core/state.js';
+import {suggest, type Suggestion} from '../ui/intentPlanner.js';
+import {
+  loadCheckpoint,
+  saveCheckpoint,
+  stopFileExists,
+  type DriveCheckpoint,
+} from './checkpoint.js';
+import {emitHalt, type HaltEmission} from './halt.js';
+import {
+  executeAction,
+  mapSuggestion,
+  type ExecutorAction,
+  type ExecutorHooks,
+  type ExecutorResult,
+} from './executor.js';
+import {generateGoalRetro} from './goalRetro.js';
+import {runRealTestIfDue, readTransientRetryConfig} from './realTest.js';
+import {replanAfterCompletion, replanAlreadyEvaluated} from './replan.js';
+
+/** Per-iteration result returned by {@link runDriveStep}. */
+export interface StepResult {
+  /** Whether the surrounding loop should advance one more step. */
+  proceed: boolean;
+  /** Halt info when `proceed === false`. */
+  halt?: HaltEmission;
+  /** Mapped action that drove this step (`null` on pre-planner halts). */
+  action?: ExecutorAction | null;
+  /** Underlying executor result for tests + progress logging. */
+  executor?: ExecutorResult;
+  /** Feature id this step touched (when known). */
+  feature_id?: string | null;
+  /** Whether the goal just transitioned to done. */
+  goal_done?: boolean;
+}
+
+/** Options accepted by {@link runDriveLoop}. */
+export interface RunDriveLoopOptions {
+  /** Path to the project's `.harness/` directory. */
+  harnessDir: string;
+  /** Maximum consecutive failures of the same gate before halt #3. */
+  maxRetries?: number;
+  /** Override clock for tests. */
+  now?: () => Date;
+  /** Test-isolation hooks for the executor (run-gate / complete / activate). */
+  executorHooks?: ExecutorHooks;
+  /** Hard cap — drive will never exceed this many iterations per call. */
+  hardIterationLimit?: number;
+}
+
+/** Default consecutive-fail threshold for halt #3 (gate retry). */
+export const DEFAULT_MAX_RETRIES = 3;
+
+/**
+ * F-121 / L-002 — sliding-window cap for the per-(feature, gate) recent
+ * results array on the checkpoint. Three entries is enough to spot
+ * stuck loops without bloating the YAML.
+ */
+export const RECENT_GATE_RESULTS_WINDOW = 3;
+
+/**
+ * F-121 / L-002 — number of consecutive identical non-pass gate results
+ * that fires halt #10 (`gate_no_progress`). Two is the smallest value
+ * that still distinguishes "first miss" from "stuck on the same point";
+ * tests assert the value to keep the contract explicit.
+ */
+export const GATE_STAGNATION_THRESHOLD = 2;
+
+/**
+ * F-140 — appends one `real_test_retry_scheduled` event to events.log.
+ * Helper kept here (rather than realTest.ts) because the retry
+ * decision lives in the loop body.
+ */
+function appendRealTestRetryEvent(
+  harnessDir: string,
+  payload: {
+    goal_id: string;
+    feature_id: string;
+    attempt: number;
+    cap: number;
+    command: string | null;
+    exit_code: number | null;
+    ts: string;
+  },
+): void {
+  const path = join(harnessDir, 'events.log');
+  const event = {
+    ts: payload.ts,
+    type: 'real_test_retry_scheduled',
+    goal: payload.goal_id,
+    feature: payload.feature_id,
+    attempt: payload.attempt,
+    cap: payload.cap,
+    command: payload.command,
+    exit_code: payload.exit_code,
+  };
+  try {
+    appendFileSync(path, `${JSON.stringify(event)}\n`, 'utf-8');
+  } catch {
+    // best-effort
+  }
+}
+
+/** Returns the current UTC timestamp formatted as `YYYY-MM-DDTHH:MM:SSZ`. */
+function nowIso(now: Date): string {
+  const yyyy = now.getUTCFullYear().toString().padStart(4, '0');
+  const mm = (now.getUTCMonth() + 1).toString().padStart(2, '0');
+  const dd = now.getUTCDate().toString().padStart(2, '0');
+  const hh = now.getUTCHours().toString().padStart(2, '0');
+  const mi = now.getUTCMinutes().toString().padStart(2, '0');
+  const ss = now.getUTCSeconds().toString().padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}Z`;
+}
+
+/** Type guard — narrows an unknown value to a plain object. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Returns `true` when the project's working tree (or staged area) is
+ * dirty.
+ *
+ * Drives halt #2 (commit_boundary). Whitelisted paths — `.harness/`
+ * runtime + `_workspace/*` ceremony output + `CHANGELOG.md` — are
+ * the only changes drive's own iterations should produce, so they
+ * don't count as "dirty" for the user-commit halt.
+ */
+function workingTreeDirty(projectRoot: string): boolean {
+  try {
+    // Use `git status --porcelain=v1` rather than `git diff --quiet`
+    // so we can filter the whitelisted paths inline.
+    const out = execFileSync('git', ['status', '--porcelain=v1'], {
+      cwd: projectRoot,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf-8',
+    });
+    if (out.trim().length === 0) {
+      return false;
+    }
+    const lines = out.split('\n').filter((l) => l.trim().length > 0);
+    for (const line of lines) {
+      const path = line.slice(3); // strip the two-char status + space
+      if (
+        path.startsWith('.harness/state.yaml') ||
+        path.startsWith('.harness/_workspace/') ||
+        path === 'CHANGELOG.md'
+      ) {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  } catch {
+    // No git, or git failed — drive cannot enforce the boundary; treat
+    // as not-dirty so the loop proceeds. The working-tree guard inside
+    // `complete()` is the second line of defence.
+    return false;
+  }
+}
+
+/**
+ * Resolves the next feature drive should work on inside the active
+ * Goal.
+ *
+ * Prefers `in_progress` (continuation), then the first `planned` in
+ * `feature_progress` order. Returns `null` when all features are done
+ * — the loop interprets that as goal-complete.
+ */
+function pickActiveFeature(
+  ck: DriveCheckpoint,
+  state: State,
+): {fid: string; status: FeatureStatus} | null {
+  // Walk in scaffold order so drive picks the same sequence the
+  // planner produced. Priority: in_progress → planned → blocked.
+  // Blocked is included so halt #5 can fire when every remaining
+  // feature is blocked (otherwise the loop would silently dead-end).
+  for (const fid of ck.plan.scaffolded_features) {
+    const feature = state.getFeature(fid);
+    if (feature === null) {
+      continue;
+    }
+    if (feature.status === 'in_progress') {
+      return {fid, status: 'in_progress'};
+    }
+  }
+  for (const fid of ck.plan.scaffolded_features) {
+    const feature = state.getFeature(fid);
+    if (feature === null) {
+      return {fid, status: 'planned'};
+    }
+    if (feature.status === 'planned') {
+      return {fid, status: 'planned'};
+    }
+  }
+  for (const fid of ck.plan.scaffolded_features) {
+    const feature = state.getFeature(fid);
+    if (feature !== null && feature.status === 'blocked') {
+      return {fid, status: 'blocked'};
+    }
+  }
+  return null;
+}
+
+/** Returns `true` when every feature in the goal has status `done`. */
+function allFeaturesDone(ck: DriveCheckpoint, state: State): boolean {
+  if (ck.plan.scaffolded_features.length === 0) {
+    return false;
+  }
+  for (const fid of ck.plan.scaffolded_features) {
+    const feature = state.getFeature(fid);
+    if (feature === null || feature.status !== 'done') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Returns the spec.yaml object for `intentPlanner.suggest()`. Empty
+ * object when missing — `suggest()` tolerates `null` / `{}`.
+ */
+function loadSpecForPlanner(harnessDir: string): unknown {
+  const path = join(harnessDir, 'spec.yaml');
+  if (!existsSync(path)) {
+    return null;
+  }
+  try {
+    return yamlParse(readFileSync(path, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Picks the suggestion drive will consume from the planner output.
+ *
+ * Drive uses the *first* suggestion only — `intentPlanner.suggest()`
+ * already orders them with the recommended action at index 0. The
+ * remaining suggestions exist for the dashboard UI; drive does not
+ * present them.
+ */
+function chooseSuggestion(suggestions: Suggestion[]): Suggestion | null {
+  return suggestions.length === 0 ? null : (suggestions[0] ?? null);
+}
+
+/**
+ * Updates per-feature, per-gate consecutive-fail counters in the
+ * checkpoint.
+ *
+ * Resets the counter to 0 when a gate passes; increments on a fail.
+ * The retry-threshold halt (#3) is fired by the loop when any value
+ * crosses {@link DEFAULT_MAX_RETRIES}.
+ */
+function bumpRetryCounter(
+  ck: DriveCheckpoint,
+  fid: string,
+  gate: string,
+  failed: boolean,
+): number {
+  if (!isPlainObject(ck.execute.retry_counts[fid])) {
+    ck.execute.retry_counts[fid] = {};
+  }
+  const map = ck.execute.retry_counts[fid] as Record<string, number>;
+  if (!failed) {
+    map[gate] = 0;
+    return 0;
+  }
+  const next = (map[gate] ?? 0) + 1;
+  map[gate] = next;
+  return next;
+}
+
+/**
+ * F-121 / L-002 — appends a gate result to the per-(feature, gate)
+ * sliding window on the checkpoint and reports whether the window has
+ * stagnated.
+ *
+ * Stagnation = the last {@link GATE_STAGNATION_THRESHOLD} entries are
+ * identical AND the result is not `pass`. A `pass` entry resets the
+ * window's stagnation potential — the function still records it so the
+ * audit trail is preserved, but the return flag is false.
+ *
+ * Defensive against legacy checkpoints (`recent_gate_results` may be
+ * absent on pre-F-121 runs); the field is initialised on first call.
+ */
+function recordGateResult(
+  ck: DriveCheckpoint,
+  fid: string,
+  gate: string,
+  result: 'pass' | 'fail' | 'skipped',
+): {window: Array<'pass' | 'fail' | 'skipped'>; stagnated: boolean} {
+  if (!isPlainObject(ck.execute.recent_gate_results)) {
+    ck.execute.recent_gate_results = {};
+  }
+  if (!isPlainObject(ck.execute.recent_gate_results[fid])) {
+    ck.execute.recent_gate_results[fid] = {};
+  }
+  const perFeature = ck.execute.recent_gate_results[fid] as Record<
+    string,
+    Array<'pass' | 'fail' | 'skipped'>
+  >;
+  const window = Array.isArray(perFeature[gate]) ? [...perFeature[gate]] : [];
+  window.push(result);
+  while (window.length > RECENT_GATE_RESULTS_WINDOW) {
+    window.shift();
+  }
+  perFeature[gate] = window;
+
+  if (result === 'pass') {
+    return {window, stagnated: false};
+  }
+  if (window.length < GATE_STAGNATION_THRESHOLD) {
+    return {window, stagnated: false};
+  }
+  const tail = window.slice(-GATE_STAGNATION_THRESHOLD);
+  const stagnated = tail.every((r) => r === result);
+  return {window, stagnated};
+}
+
+/** Returns `feature.status` from a possibly-missing record. */
+function statusOf(feature: Feature | null): FeatureStatus {
+  return feature === null ? 'planned' : feature.status;
+}
+
+/**
+ * Executes one drive iteration.
+ *
+ * Halt order (each is checked before the planner is invoked):
+ *
+ *   1. STOP file → halt #9
+ *   2. iteration cap → halt #7
+ *   3. wall-clock cap → halt #6
+ *   4. all features done → emit goal-retro, mark phase=done, return
+ *      `goal_done: true`
+ *   5. active feature == blocked → halt #5
+ *   6. working tree dirty → halt #2
+ *
+ * After those guards pass, the planner runs and the executor
+ * dispatches the resulting Suggestion. A failed `run_gate` increments
+ * the retry counter and may fire halt #3.
+ *
+ * @returns Per-iteration {@link StepResult}.
+ */
+export function runDriveStep(
+  harnessDir: string,
+  options: RunDriveLoopOptions,
+): StepResult {
+  const now = options.now ? options.now() : new Date();
+  const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+
+  let ck = loadCheckpoint(harnessDir);
+  if (ck === null) {
+    return {
+      proceed: false,
+      halt: emitHalt(harnessDir, 'manual', 'no drive checkpoint — run `harness drive "<goal>"` first.'),
+    };
+  }
+
+  // (1) STOP file emergency pedal — halt #9.
+  if (stopFileExists(harnessDir)) {
+    return {
+      proceed: false,
+      halt: emitHalt(harnessDir, 'stop_file', 'STOP file present — drive halted.', {
+        goal_id: ck.goal_id,
+        iteration: ck.execute.iteration,
+        now,
+      }),
+    };
+  }
+
+  // (2) iteration cap — halt #7.
+  if (ck.execute.iteration >= ck.execute.max_iterations) {
+    return {
+      proceed: false,
+      halt: emitHalt(
+        harnessDir,
+        'iteration_cap',
+        `iteration cap ${ck.execute.max_iterations} reached.`,
+        {goal_id: ck.goal_id, iteration: ck.execute.iteration, now},
+      ),
+    };
+  }
+
+  // (3) wall-clock cap — halt #6.
+  const startedAt = ck.execute.started_at;
+  if (typeof startedAt === 'string' && startedAt.length > 0) {
+    const startMs = Date.parse(startedAt);
+    if (!Number.isNaN(startMs)) {
+      const elapsed = Math.floor((now.getTime() - startMs) / 1000);
+      if (elapsed >= ck.execute.max_seconds) {
+        return {
+          proceed: false,
+          halt: emitHalt(
+            harnessDir,
+            'wall_clock',
+            `wall-clock cap ${ck.execute.max_seconds}s reached (${elapsed}s elapsed).`,
+            {goal_id: ck.goal_id, iteration: ck.execute.iteration, now},
+          ),
+        };
+      }
+    }
+  } else {
+    ck.execute.started_at = nowIso(now);
+  }
+
+  // (3.5) F-138 + F-142 — adaptive replan hook. Iterates the goal's
+  // feature_progress for every done id whose events.log lacks a
+  // `replan_evaluated` entry, calls `replanAfterCompletion` for
+  // each. The existing per-id idempotent guard inside that function
+  // makes the iteration safe — re-evaluation is a silent skip.
+  //
+  // F-142 widens the trigger from "drive's own previous step" to
+  // "any pending done feature drive hasn't seen yet" so the hook
+  // also fires when the user mixes work CLI with drive --resume.
+  //
+  // (3.6) F-139 — mid-cycle real test. Runs the user-defined
+  // `harness.yaml drive.real_test.command` once per drive iteration
+  // when the cadence (`every_n_features`, default 3) divides the
+  // current done count. Unconfigured projects skip silently. On
+  // fail, surfaces `real_test_failed` halt (with F-140 transient
+  // retry first when configured).
+  try {
+    const replanState = State.load(harnessDir);
+    const goal = replanState.getGoal(ck.goal_id);
+    const unevaluatedDone: string[] = [];
+    if (goal !== null && isPlainObject(goal.feature_progress)) {
+      const progress = goal.feature_progress as Record<string, FeatureStatus>;
+      for (const [fid, status] of Object.entries(progress)) {
+        if (status !== 'done') continue;
+        if (replanAlreadyEvaluated(harnessDir, fid)) continue;
+        unevaluatedDone.push(fid);
+      }
+    }
+    for (const fid of unevaluatedDone) {
+      replanAfterCompletion(harnessDir, fid, ck.goal_id);
+    }
+    // Real-test cadence: fire once when there are unevaluated done
+    // ids (or when the active_feature path matches the legacy trigger
+    // — preserves retry semantics). Picks the most recent unevaluated
+    // id as the "trigger" feature for the event payload.
+    const triggerFid =
+      unevaluatedDone.length > 0
+        ? unevaluatedDone[unevaluatedDone.length - 1]
+        : ck.execute.active_feature;
+    const triggerActive =
+      triggerFid !== null ? replanState.getFeature(triggerFid) : null;
+    if (triggerFid !== null && triggerActive !== null && triggerActive.status === 'done') {
+      const realTest = runRealTestIfDue(harnessDir, ck.goal_id, triggerFid);
+      if (realTest.ran && realTest.passed === true) {
+        // F-140 — pass resets the transient retry counter so a
+        // future flake starts from zero again.
+        if ((ck.execute.real_test_retry_count ?? 0) > 0) {
+          ck.execute.real_test_retry_count = 0;
+          saveCheckpoint(harnessDir, ck, now);
+        }
+      }
+      if (realTest.ran && realTest.passed === false) {
+        // F-140 — auto-retry once (configurable cap) before yielding.
+        const retryCfg = readTransientRetryConfig(harnessDir);
+        const currentCount = ck.execute.real_test_retry_count ?? 0;
+        if (retryCfg.enabled && currentCount < retryCfg.cap) {
+          ck.execute.real_test_retry_count = currentCount + 1;
+          saveCheckpoint(harnessDir, ck, now);
+          appendRealTestRetryEvent(harnessDir, {
+            goal_id: ck.goal_id,
+            feature_id: triggerFid,
+            attempt: currentCount + 1,
+            cap: retryCfg.cap,
+            command: realTest.command,
+            exit_code: realTest.exit_code,
+            ts: nowIso(now),
+          });
+          // Return proceed=true with no executor action — the next
+          // iteration re-enters this hook (active_feature is still
+          // the just-completed one) and re-runs the real test.
+          return {
+            proceed: true,
+            feature_id: triggerFid,
+          };
+        }
+        return {
+          proceed: false,
+          halt: emitHalt(
+            harnessDir,
+            'manual',
+            `real_test_failed: ${realTest.command} (exit ${realTest.exit_code}, ` +
+              `attempt ${currentCount + 1}/${retryCfg.cap + 1}). ` +
+              `Inspect events.log for stderr tail.`,
+            {goal_id: ck.goal_id, feature_id: triggerFid, now},
+          ),
+        };
+      }
+    }
+  } catch {
+    // silent — replan / real-test are auxiliary
+  }
+
+  // (4) goal completion check — emit retro + flip phase.
+  const stateGoalCheck = State.load(harnessDir);
+  if (allFeaturesDone(ck, stateGoalCheck)) {
+    if (ck.phase !== 'done') {
+      try {
+        generateGoalRetro(harnessDir, ck.goal_id, {now});
+      } catch {
+        // Retro generation is best-effort — never block the goal flip.
+      }
+      ck.phase = 'done';
+      stateGoalCheck.setGoalStatus(ck.goal_id, 'done');
+      stateGoalCheck.save();
+      saveCheckpoint(harnessDir, ck, now);
+    }
+    return {proceed: false, goal_done: true};
+  }
+
+  // (5) blocked active feature — halt #5.
+  const active = pickActiveFeature(ck, stateGoalCheck);
+  if (active === null) {
+    // Defensive — should have been caught by (4).
+    return {
+      proceed: false,
+      halt: emitHalt(harnessDir, 'manual', 'no active feature in goal — please inspect spec.yaml.'),
+    };
+  }
+  const activeFeature = stateGoalCheck.getFeature(active.fid);
+  if (statusOf(activeFeature) === 'blocked') {
+    return {
+      proceed: false,
+      halt: emitHalt(
+        harnessDir,
+        'feature_blocked',
+        `${active.fid} is blocked — unblock then resume.`,
+        {goal_id: ck.goal_id, feature_id: active.fid, iteration: ck.execute.iteration, now},
+      ),
+    };
+  }
+
+  // (6) commit boundary — halt #2.
+  // Only relevant once the active feature has reached the gate-pass
+  // floor (Iron Law-eligible). Dirty earlier is fine — drive's own
+  // mutations to .harness/state.yaml are whitelisted.
+  if (activeFeature !== null && countDeclaredEvidence(activeFeature) >= 1) {
+    const gate5 = activeFeature.gates['gate_5'];
+    if (isPlainObject(gate5) && gate5.last_result === 'pass') {
+      const projectRoot = dirname(harnessDir);
+      if (workingTreeDirty(projectRoot)) {
+        return {
+          proceed: false,
+          halt: emitHalt(
+            harnessDir,
+            'commit_boundary',
+            `${active.fid} is ready to complete — review changes and \`git commit\`, then resume.`,
+            {
+              goal_id: ck.goal_id,
+              feature_id: active.fid,
+              iteration: ck.execute.iteration,
+              now,
+            },
+          ),
+        };
+      }
+    }
+  }
+
+  // ----- planner + executor -----
+  const spec = loadSpecForPlanner(harnessDir);
+  // Force the planner's `active_feature_id` so it gives suggestions
+  // for the goal's current feature, not the project-wide active.
+  const stateForPlanner = State.load(harnessDir);
+  if (stateForPlanner.data.session.active_feature_id !== active.fid) {
+    // Persist the pointer so the planner picks the right feature on
+    // the next iteration too. This is the only state-mutation drive
+    // makes outside of the work cycle itself.
+    stateForPlanner.setActive(active.fid);
+    stateForPlanner.save();
+  }
+
+  const suggestions = suggest(stateForPlanner.data, spec);
+  const chosen = chooseSuggestion(suggestions);
+  if (chosen === null) {
+    return {
+      proceed: false,
+      halt: emitHalt(
+        harnessDir,
+        'manual',
+        `intentPlanner returned no suggestion for ${active.fid} — inspect state.yaml.`,
+        {goal_id: ck.goal_id, feature_id: active.fid, now},
+      ),
+    };
+  }
+
+  const mapped = mapSuggestion(chosen);
+  const executed = executeAction(harnessDir, mapped, options.executorHooks);
+
+  // Counter bookkeeping for halt #3 + sliding window for halt #10.
+  // Order matters: retry_threshold is evaluated first so consecutive
+  // FAIL still routes to #3 (its dedicated reason); #10 catches the
+  // residual cases (typically `skipped` from undetectable gates).
+  if (mapped.kind === 'run_gate' && executed.work !== undefined) {
+    const failed =
+      Array.isArray(executed.work.gates_failed) && executed.work.gates_failed.includes(mapped.gate);
+    const count = bumpRetryCounter(ck, mapped.feature_id, mapped.gate, failed);
+    if (count >= maxRetries) {
+      ck.execute.iteration += 1;
+      saveCheckpoint(harnessDir, ck, now);
+      return {
+        proceed: false,
+        action: mapped,
+        executor: executed,
+        feature_id: mapped.feature_id,
+        halt: emitHalt(
+          harnessDir,
+          'retry_threshold',
+          `${mapped.gate} on ${mapped.feature_id} failed ${count} times in a row — yielding.`,
+          {
+            goal_id: ck.goal_id,
+            feature_id: mapped.feature_id,
+            gate: mapped.gate,
+            iteration: ck.execute.iteration,
+            now,
+          },
+        ),
+      };
+    }
+
+    // F-121 / L-002 — stagnation detector for non-fail repeats. The
+    // executor's gate result is derived from work.gates_failed (fail)
+    // and work.gates_passed (pass); anything else is `skipped`. A
+    // window of N=GATE_STAGNATION_THRESHOLD identical non-pass entries
+    // halts the loop with an actionable hint instead of burning the
+    // iteration cap on the same point.
+    const passed =
+      Array.isArray(executed.work.gates_passed) && executed.work.gates_passed.includes(mapped.gate);
+    const result: 'pass' | 'fail' | 'skipped' = failed ? 'fail' : passed ? 'pass' : 'skipped';
+    const {stagnated, window} = recordGateResult(ck, mapped.feature_id, mapped.gate, result);
+    if (stagnated) {
+      ck.execute.iteration += 1;
+      saveCheckpoint(harnessDir, ck, now);
+      return {
+        proceed: false,
+        action: mapped,
+        executor: executed,
+        feature_id: mapped.feature_id,
+        halt: emitHalt(
+          harnessDir,
+          'gate_no_progress',
+          `${mapped.gate} on ${mapped.feature_id} produced '${result}' ${window.length} times in a row with no detectable progress — yielding.`,
+          {
+            goal_id: ck.goal_id,
+            feature_id: mapped.feature_id,
+            gate: mapped.gate,
+            iteration: ck.execute.iteration,
+            result,
+            window_size: window.length,
+            now,
+          },
+        ),
+      };
+    }
+  }
+
+  // Persist iteration bookkeeping.
+  ck.execute.iteration += 1;
+  ck.execute.active_feature = active.fid;
+  ck = recomputeElapsed(ck, now);
+  saveCheckpoint(harnessDir, ck, now);
+
+  // Mirror feature progress on the goal.
+  const stateAfter = State.load(harnessDir);
+  for (const fid of ck.plan.scaffolded_features) {
+    const f = stateAfter.getFeature(fid);
+    stateAfter.setGoalFeatureProgress(ck.goal_id, fid, statusOf(f));
+  }
+  if (ck.phase !== 'executing') {
+    ck.phase = 'executing';
+    stateAfter.setGoalStatus(ck.goal_id, 'executing');
+    saveCheckpoint(harnessDir, ck, now);
+  }
+  stateAfter.save();
+
+  return {
+    proceed: executed.proceed,
+    action: mapped,
+    executor: executed,
+    feature_id: active.fid,
+    halt: executed.halt
+      ? emitHalt(harnessDir, executed.halt.reason, executed.halt.message, {
+          goal_id: ck.goal_id,
+          feature_id: active.fid,
+          iteration: ck.execute.iteration,
+          now,
+        })
+      : undefined,
+  };
+}
+
+/**
+ * Drives the loop until any halt fires, the goal completes, or the
+ * hard iteration limit is hit.
+ *
+ * `runDriveStep` already enforces the per-Goal iteration / wall-clock
+ * caps stored in the checkpoint; `hardIterationLimit` exists as an
+ * additional ceiling for the whole `runDriveLoop` invocation (e.g.
+ * the dry-run integration test that wants to assert a known number of
+ * steps).
+ */
+export function runDriveLoop(options: RunDriveLoopOptions): StepResult {
+  const hardLimit = options.hardIterationLimit ?? Number.POSITIVE_INFINITY;
+  let last: StepResult = {proceed: true};
+  let count = 0;
+  while (last.proceed && count < hardLimit) {
+    last = runDriveStep(options.harnessDir, options);
+    count += 1;
+    if (last.goal_done) {
+      return last;
+    }
+  }
+  return last;
+}
+
+/** Updates `elapsed_sec` on the checkpoint based on `started_at`. */
+function recomputeElapsed(ck: DriveCheckpoint, now: Date): DriveCheckpoint {
+  if (typeof ck.execute.started_at !== 'string') {
+    return ck;
+  }
+  const startMs = Date.parse(ck.execute.started_at);
+  if (Number.isNaN(startMs)) {
+    return ck;
+  }
+  const elapsed = Math.max(0, Math.floor((now.getTime() - startMs) / 1000));
+  ck.execute.elapsed_sec = elapsed;
+  return ck;
+}
+
+/** Mirrors `isDeclaredEvidence` from core/state without importing — leaf module. */
+function countDeclaredEvidence(feature: Feature): number {
+  if (!Array.isArray(feature.evidence)) {
+    return 0;
+  }
+  let count = 0;
+  for (const ev of feature.evidence) {
+    if (!isPlainObject(ev)) {
+      continue;
+    }
+    const kind = ev.kind;
+    if (typeof kind === 'string' && (kind === 'gate_run' || kind === 'gate_auto_run')) {
+      continue;
+    }
+    count += 1;
+  }
+  return count;
+}

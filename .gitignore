@@ -1,0 +1,70 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Environment
+.env
+.env.*
+
+# Backup
+*.bak
+
+# Logs
+*.log
+
+# Node toolchain
+node_modules/
+coverage/
+.nyc_output/
+.vitest-cache/
+
+# Python toolchain
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Translation shadow directory (user learning aid, not for commit)
+translations-ko/
+
+# Personal design notes (user-only workspace, not for commit)
+design/
+
+# Archived v0.1.0 tree — already-tracked files remain tracked,
+# but no new local artifacts under legacy/ should enter git
+legacy/
+
+# Quarantined Python test suites (F-126) — retired after the v0.13.0
+# Python -> TypeScript cutover. The TS parity suite under tests/parity/
+# is the operational test surface; these directories remain on the
+# maintainer's disk for local reference only and must not re-enter git.
+tests/unit/
+tests/integration/
+tests/scale/
+
+# harness-boot 자체 도그푸드 (.harness/) — derived + 로그 + ceremony 산출은 미추적.
+# spec.yaml · state.yaml · README.md · _workspace/issues-log.md 만 tracked.
+.harness/events.log
+.harness/harness.yaml
+.harness/domain.md
+.harness/architecture.yaml
+.harness/chapters/
+.harness/area_index.yaml
+# .harness/_workspace/ 는 ceremony 산출 + observability log. 단 issues-log.md 만 tracked
+# (F-027 maintainer 환원 사이클의 SSoT). 디렉터리 자체를 ignore 하면 negation 이 안 듣기 때문에
+# 안의 파일만 와일드카드로 ignore + 명시적 unignore.
+.harness/_workspace/*
+.harness/_workspace/**/
+!.harness/_workspace/issues-log.md
+
+# F-107 — dist/ committed for plugin install (no build step required)
+# Keep dist/ tracked so npx harness works out of the box; we do NOT add it back to .gitignore.

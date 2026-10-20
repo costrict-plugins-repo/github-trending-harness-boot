@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "harness-boot",
+  "description": "Single-plugin marketplace publishing the harness plugin directly from this repository. Lets users install via `/plugin marketplace add github:qwerfunch/harness-boot` without going through the public claude-plugins-official marketplace.",
+  "owner": {
+    "name": "qwerfunch",
+    "url": "https://github.com/qwerfunch"
+  },
+  "plugins": [
+    {
+      "name": "harness-boot",
+      "description": "Multi-agent development harness for Claude Code. Your AI has speed; we give it direction — through living specs and focused specialist agents.",
+      "source": "./",
+      "version": "0.15.11",
+      "homepage": "https://github.com/qwerfunch/harness-boot",
+      "category": "development"
+    }
+  ]
+}

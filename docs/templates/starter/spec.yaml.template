@@ -1,0 +1,69 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/qwerfunch/harness-boot/main/docs/schemas/spec.schema.json
+# .harness/spec.yaml
+# ================================================================
+# harness-boot v2.3.8 · 사용자가 편집하는 **유일한** 구조화 입력.
+# 이 파일을 채우면 /harness:sync 가 나머지를 파생 생성합니다.
+#
+# 더 완전한 예시: `design/samples/url-shortener/spec.yaml` 참고.
+# 9 블록 네이티브 배치: `metadata.*` 에 직접 (v2.3.8 승격 완료).
+#
+# IDE 지원 (F-020, v0.3.11+): 위 첫 줄의 $schema 주석으로
+# VSCode/IntelliJ 의 YAML Language Server 가 자동완성·검증·에러
+# 하이라이팅을 제공합니다. VSCode 확장: redhat.vscode-yaml.
+# ================================================================
+
+version: "2.3"
+
+project:
+  name: ""                    # 제품 이름 (필수)
+  summary: ""                 # 한 문장 요약 (필수). 빈 따옴표면 sync 가 schema 에러로 거부
+  description: ""             # 🗒 한 단락 정도. 길면 $include 권장
+  vision: ""                  # 🗒 저자 강조 3축 중 1~2개 문장화
+  stakeholders: []            # end-user 제외
+  # brief:                    # v0.5 additive — researcher/product-planner 가 채움
+  #   origin: researcher      # researcher | plan.md | manual
+  #   assumptions: []
+  #   open_questions: []
+  #   competitors_studied: []
+  #   confidence_overall: medium
+
+domain:
+  entities: []                # 3~7개 권장. sensitive 엔티티는 자동 제안됨
+  business_rules: []          # statement + rationale 분리
+
+constraints:
+  tech_stack: {}              # 결정값만 (이유는 ADR 로)
+
+deliverable:                  # v2.3 필수
+  type: ""                    # cli | web-service | game | worker | library | static-site
+  entry_points: []
+  smoke_scenarios: []         # 최소 1개
+
+features:
+  - id: F-0
+    type: skeleton            # features[0] 은 반드시 skeleton
+    title: ""
+    priority: P0
+    test_strategy: lean-tdd
+    acceptance_criteria: []
+    modules: []
+    # ui_surface:             # v0.5 additive — UI 있는 피처에만
+    #   present: true
+    #   platforms: [web]      # web | mobile-ios | mobile-android | desktop | game | tui
+    #   has_audio: false      # true 면 audio-designer 소환
+
+metadata:
+  source:
+    origin: idea              # idea | planning_doc | architecture_doc
+    maturity: planning        # planning | architecture | implementation
+    revision: "v0.1"
+  # 아래 9 블록은 필요할 때만 채움 (빈 블록은 삭제)
+  # command_map: []
+  # ambient_files: []
+  # host_binding: {}
+  # drift_catalog: []
+  # versioning_axes: []
+  # contribution_points: []
+  # preamble_contract: {}
+  # changelog: []
+  # gate_chain: []
